@@ -1,7 +1,8 @@
+// SPDX-License-Identifier: MPL-2.0
 //
 // Do NOT modify or remove this copyright and license
 //
-// Copyright (c) 2012-2021 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+// Copyright (c) 2012-2024 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
 //
 // This software is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -10,7 +11,18 @@
 // ******************************************************************************************
 // 
 
-#if !defined (DISABLE_NVME_PASSTHROUGH)
+#include "common_types.h"
+#include "precision_timer.h"
+#include "memory_safety.h"
+#include "type_conversion.h"
+#include "string_utils.h"
+#include "bit_manip.h"
+#include "code_attributes.h"
+#include "math_utils.h"
+#include "error_translation.h"
+#include "io_utils.h"
+#include "unit_conversion.h"
+
 #include "nvme_operations.h"
 
 void nvme_Print_Feature_Identifiers_Help(void)
@@ -34,34 +46,69 @@ void nvme_Print_Feature_Identifiers_Help(void)
     printf("0Bh       \t M \t   NO       \tAsynchronous Event Configuration\n");
     printf("0Ch       \t O \t   NO       \tAutonomous Power State Transition\n");
     printf("0Dh       \t O \t   NO       \tHost Memory Buffer\n");
-    printf("0Eh-77h   \t   \t            \tReserved          \n");
+    printf("0Eh       \t O \t   NO       \tTimestamp\n");
+    printf("0Fh       \t M \t   NO       \tKeep Alive Timer\n");
+    printf("10h       \t O \t   YES      \tHost Controlled Thermal Management\n");
+    printf("11h       \t O \t   NO       \tNon-Operational Power State Config\n");
+    printf("12h       \t M \t   YES      \tRead Recovery Level Config\n");
+    printf("13h       \t M \t   NO       \tPredicatable Latency Mode Config\n");
+    printf("14h       \t M \t   NO       \tPredicatable Latency Mode Window\n");
+    printf("15h       \t M \t   NO       \tLBA Status Information Report Interval\n");
+    printf("16h       \t M \t   NO       \tHost Behavior Support\n");
+    printf("17h       \t O \t   YES      \tSanitize Config\n");
+    printf("18h       \t O \t   NO       \tEndurance Group Event Configuration\n");
+    printf("19h-77h   \t   \t            \tReserved          \n");
     printf("78h-7Fh   \t   \t            \tRefer to NVMe Management Spec\n");
     printf("80h-BFh   \t   \t            \tCommand Set Specific (Reserved)\n");
+    printf("80h       \t O \t   NO       \tSoftware Progress Marker (NVM)\n");
+    printf("81h       \t O \t   NO       \tHost Identifier (NVM)\n");
+    printf("82h       \t O \t   NO       \tReservation Notification Mask (NVM)\n");
+    printf("83h       \t O \t   NO       \tReservation Persistence (NVM)\n");
+    printf("84h       \t O \t   NO       \tNamespace Write Protection Config (NVM)\n");
     printf("C0h-FFh   \t   \t            \tVendor Specific\n");
     printf("====================================================\n");
+    printf("NOTE: Some \"Mandatory\" features may not be supported by some drives due to\n");
+    printf("      conforming to older specifications from before these features were\n");
+    printf("      standardized.\n");
+    printf("NOTE: This list is not exhaustive and not an indication of what is supported\n");
+    printf("      by a given device. It is simply a list of known feature IDs as of NVMe 1.4\n");
 }
 
-int nvme_Print_All_Feature_Identifiers(tDevice *device, eNvmeFeaturesSelectValue selectType, M_ATTR_UNUSED bool listOnlySupportedFeatures)
+//This is far from perfect. Not all features will be supported, so would be better to have something check if
+//      a feature is supported in the identify data then request information about it as needed.
+//      it would also be helpful to have the name of the feature output as well.-TJE
+eReturnValues nvme_Print_All_Feature_Identifiers(tDevice *device, eNvmeFeaturesSelectValue selectType, M_ATTR_UNUSED bool listOnlySupportedFeatures)
 {
-    int ret = UNKNOWN;
-    uint8_t featureID;
+    eReturnValues ret = UNKNOWN;
+    uint16_t featureID;
     nvmeFeaturesCmdOpt featureCmd;
+    bool vendorUniqueLinePrinted = false;
+    bool commandSetSpecificLinePrinted = false;
 #ifdef _DEBUG
     printf("-->%s\n", __FUNCTION__);
 #endif
-    printf(" Feature ID\tRaw Value\n");
+    printf(" Feature ID\tRaw Value (DWORD 0)\n");
     printf("===============================\n");
-    for (featureID = 1; featureID < 0x0C; featureID++)
+    for (featureID = 1; featureID <= 0xFF; featureID++)
     {
-        if (featureID == NVME_FEAT_LBA_RANGE_)
-        {
-            continue;
-        }
+        DECLARE_ZERO_INIT_ARRAY(uint8_t, featData, 4096);
         memset(&featureCmd, 0, sizeof(nvmeFeaturesCmdOpt));
-        featureCmd.fid = featureID;
-        featureCmd.sel = selectType;
+        featureCmd.fid = C_CAST(uint8_t, featureID);
+        featureCmd.sel = C_CAST(uint8_t, selectType);
+        featureCmd.dataLength = 4096;
+        featureCmd.dataPtr = featData;
         if (nvme_Get_Features(device, &featureCmd) == SUCCESS)
         {
+            if (!vendorUniqueLinePrinted && featureID >= 0xC0)
+            {
+                printf("---------Vendor Unique---------\n");
+                vendorUniqueLinePrinted = true;
+            }
+            else if (!commandSetSpecificLinePrinted && featureID >= 0x80)
+            {
+                printf("------Command Set Specific-----\n");
+                commandSetSpecificLinePrinted = true;
+            }
             printf("    %02Xh    \t0x%08X\n", featureID, featureCmd.featSetGetValue);
         }
     }
@@ -73,25 +120,25 @@ int nvme_Print_All_Feature_Identifiers(tDevice *device, eNvmeFeaturesSelectValue
     return ret;
 }
 
-int nvme_Print_Arbitration_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue selectType)
+static eReturnValues nvme_Print_Arbitration_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue selectType)
 {
-    int ret = UNKNOWN;
+    eReturnValues ret = UNKNOWN;
     nvmeFeaturesCmdOpt featureCmd;
 #ifdef _DEBUG
     printf("-->%s\n", __FUNCTION__);
 #endif
     memset(&featureCmd, 0, sizeof(nvmeFeaturesCmdOpt));
     featureCmd.fid = NVME_FEAT_ARBITRATION_;
-    featureCmd.sel = selectType;
+    featureCmd.sel = C_CAST(uint8_t, selectType);
     ret = nvme_Get_Features(device, &featureCmd);
     if (ret == SUCCESS)
     {
         printf("\n\tArbitration & Command Processing Feature\n");
         printf("=============================================\n");
-        printf("Hi  Priority Weight (HPW) :\t\t0x%02X\n", ((featureCmd.featSetGetValue & 0xFF000000) >> 24));
-        printf("Med Priority Weight (MPW) :\t\t0x%02X\n", ((featureCmd.featSetGetValue & 0x00FF0000) >> 16));
-        printf("Low Priority Weight (LPW) :\t\t0x%02X\n", ((featureCmd.featSetGetValue & 0x0000FF00) >> 8));
-        printf("Arbitration Burst    (AB) :\t\t0x%02X\n", featureCmd.featSetGetValue & 0x00000003);
+        printf("Hi  Priority Weight (HPW) :\t\t0x%02" PRIX8 "\n", C_CAST(uint8_t, M_GETBITRANGE(featureCmd.featSetGetValue, 31, 24)));
+        printf("Med Priority Weight (MPW) :\t\t0x%02" PRIX8 "\n", C_CAST(uint8_t, M_GETBITRANGE(featureCmd.featSetGetValue, 23, 16)));
+        printf("Low Priority Weight (LPW) :\t\t0x%02" PRIX8 "\n", C_CAST(uint8_t, M_GETBITRANGE(featureCmd.featSetGetValue, 15, 8)));
+        printf("Arbitration Burst    (AB) :\t\t0x%02" PRIX8 "\n", C_CAST(uint8_t, M_GETBITRANGE(featureCmd.featSetGetValue, 2, 0)));
     }
 #ifdef _DEBUG
     printf("<--%s (%d)\n", __FUNCTION__, ret);
@@ -99,11 +146,10 @@ int nvme_Print_Arbitration_Feature_Details(tDevice *device, eNvmeFeaturesSelectV
     return ret;
 }
 
-
 //Temperature Threshold 
-int nvme_Print_Temperature_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue selectType)
+static eReturnValues nvme_Print_Temperature_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue selectType)
 {
-    int ret = UNKNOWN;
+    eReturnValues ret = UNKNOWN;
     nvmeFeaturesCmdOpt featureCmd;
     uint8_t   TMPSEL = 0; //0=Composite, 1=Sensor 1, 2=Sensor 2, ...
 #ifdef _DEBUG
@@ -111,7 +157,7 @@ int nvme_Print_Temperature_Feature_Details(tDevice *device, eNvmeFeaturesSelectV
 #endif
     memset(&featureCmd, 0, sizeof(nvmeFeaturesCmdOpt));
     featureCmd.fid = NVME_FEAT_TEMP_THRESH_;
-    featureCmd.sel = selectType;
+    featureCmd.sel = C_CAST(uint8_t, selectType);
     printf("\n\tTemperature Threshold Feature\n");
     printf("=============================================\n");
     ret = nvme_Get_Features(device, &featureCmd);
@@ -130,16 +176,16 @@ int nvme_Print_Temperature_Feature_Details(tDevice *device, eNvmeFeaturesSelectV
 
     for (TMPSEL = 1; TMPSEL <= 8; TMPSEL++)
     {
-        featureCmd.featSetGetValue = (TMPSEL << 16);
+        featureCmd.featSetGetValue = C_CAST(uint32_t, TMPSEL) << 16;
         ret = nvme_Get_Features(device, &featureCmd);
         if (ret == SUCCESS)
         {
             printf("Temperature Sensor %d  : \t0x%04X\tOver  Temp. Threshold\n", \
                 TMPSEL, (featureCmd.featSetGetValue & 0x000000FF));
         }
-        //Not get Under Temprature 
+        //Not get Under Temperature 
         // BIT20 = THSEL 0=Over Temperature Thresh. 1=Under Temperature Thresh. 
-        featureCmd.featSetGetValue = C_CAST(uint32_t, (BIT20 | (C_CAST(uint32_t, TMPSEL) << 16)));
+        featureCmd.featSetGetValue = C_CAST(uint32_t, (C_CAST(uint32_t, BIT20) | (C_CAST(uint32_t, TMPSEL) << UINT32_C(16))));
         ret = nvme_Get_Features(device, &featureCmd);
         if (ret == SUCCESS)
         {
@@ -155,16 +201,16 @@ int nvme_Print_Temperature_Feature_Details(tDevice *device, eNvmeFeaturesSelectV
 }
 
 //Power Management
-int nvme_Print_PM_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue selectType)
+static eReturnValues nvme_Print_PM_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue selectType)
 {
-    int ret = UNKNOWN;
+    eReturnValues ret = UNKNOWN;
     nvmeFeaturesCmdOpt featureCmd;
 #ifdef _DEBUG
     printf("-->%s\n", __FUNCTION__);
 #endif
     memset(&featureCmd, 0, sizeof(nvmeFeaturesCmdOpt));
     featureCmd.fid = NVME_FEAT_POWER_MGMT_;
-    featureCmd.sel = selectType;
+    featureCmd.sel = C_CAST(uint8_t, selectType);
     ret = nvme_Get_Features(device, &featureCmd);
     if (ret == SUCCESS)
     {
@@ -180,16 +226,16 @@ int nvme_Print_PM_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue sele
 }
 
 //Error Recovery
-int nvme_Print_Error_Recovery_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue selectType)
+static eReturnValues nvme_Print_Error_Recovery_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue selectType)
 {
-    int ret = UNKNOWN;
+    eReturnValues ret = UNKNOWN;
     nvmeFeaturesCmdOpt featureCmd;
 #ifdef _DEBUG
     printf("-->%s\n", __FUNCTION__);
 #endif
     memset(&featureCmd, 0, sizeof(nvmeFeaturesCmdOpt));
     featureCmd.fid = NVME_FEAT_ERR_RECOVERY_;
-    featureCmd.sel = selectType;
+    featureCmd.sel = C_CAST(uint8_t, selectType);
     ret = nvme_Get_Features(device, &featureCmd);
     if (ret == SUCCESS)
     {
@@ -205,16 +251,16 @@ int nvme_Print_Error_Recovery_Feature_Details(tDevice *device, eNvmeFeaturesSele
 }
 
 //Volatile Write Cache Feature. 
-int nvme_Print_WCE_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue selectType)
+static eReturnValues nvme_Print_WCE_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue selectType)
 {
-    int ret = UNKNOWN;
+    eReturnValues ret = UNKNOWN;
     nvmeFeaturesCmdOpt featureCmd;
 #ifdef _DEBUG
     printf("-->%s\n", __FUNCTION__);
 #endif
     memset(&featureCmd, 0, sizeof(nvmeFeaturesCmdOpt));
     featureCmd.fid = NVME_FEAT_VOLATILE_WC_;
-    featureCmd.sel = selectType;
+    featureCmd.sel = C_CAST(uint8_t, selectType);
     ret = nvme_Get_Features(device, &featureCmd);
     if (ret == SUCCESS)
     {
@@ -230,16 +276,16 @@ int nvme_Print_WCE_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue sel
 }
 
 //Number of Queues Feature 
-int nvme_Print_NumberOfQueues_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue selectType)
+static eReturnValues nvme_Print_NumberOfQueues_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue selectType)
 {
-    int ret = UNKNOWN;
+    eReturnValues ret = UNKNOWN;
     nvmeFeaturesCmdOpt featureCmd;
 #ifdef _DEBUG
     printf("-->%s\n", __FUNCTION__);
 #endif
     memset(&featureCmd, 0, sizeof(nvmeFeaturesCmdOpt));
     featureCmd.fid = NVME_FEAT_NUM_QUEUES_;
-    featureCmd.sel = selectType;
+    featureCmd.sel = C_CAST(uint8_t, selectType);
     ret = nvme_Get_Features(device, &featureCmd);
     if (ret == SUCCESS)
     {
@@ -257,16 +303,16 @@ int nvme_Print_NumberOfQueues_Feature_Details(tDevice *device, eNvmeFeaturesSele
 }
 
 //Interrupt Coalescing (08h Feature)
-int nvme_Print_Intr_Coalescing_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue selectType)
+static eReturnValues nvme_Print_Intr_Coalescing_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue selectType)
 {
-    int ret = UNKNOWN;
+    eReturnValues ret = UNKNOWN;
     nvmeFeaturesCmdOpt featureCmd;
 #ifdef _DEBUG
     printf("-->%s\n", __FUNCTION__);
 #endif
     memset(&featureCmd, 0, sizeof(nvmeFeaturesCmdOpt));
     featureCmd.fid = NVME_FEAT_IRQ_COALESCE_;
-    featureCmd.sel = selectType;
+    featureCmd.sel = C_CAST(uint8_t, selectType);
     ret = nvme_Get_Features(device, &featureCmd);
     if (ret == SUCCESS)
     {
@@ -282,16 +328,16 @@ int nvme_Print_Intr_Coalescing_Feature_Details(tDevice *device, eNvmeFeaturesSel
 }
 
 //Interrupt Vector Configuration (09h Feature)
-int nvme_Print_Intr_Config_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue selectType)
+static eReturnValues nvme_Print_Intr_Config_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue selectType)
 {
-    int ret = UNKNOWN;
+    eReturnValues ret = UNKNOWN;
     nvmeFeaturesCmdOpt featureCmd;
 #ifdef _DEBUG
     printf("-->%s\n", __FUNCTION__);
 #endif
     memset(&featureCmd, 0, sizeof(nvmeFeaturesCmdOpt));
     featureCmd.fid = NVME_FEAT_IRQ_CONFIG_;
-    featureCmd.sel = selectType;
+    featureCmd.sel = C_CAST(uint8_t, selectType);
     ret = nvme_Get_Features(device, &featureCmd);
     if (ret == SUCCESS)
     {
@@ -307,16 +353,16 @@ int nvme_Print_Intr_Config_Feature_Details(tDevice *device, eNvmeFeaturesSelectV
 }
 
 //Write Atomicity Normal (0Ah Feature)
-int nvme_Print_Write_Atomicity_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue selectType)
+static eReturnValues nvme_Print_Write_Atomicity_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue selectType)
 {
-    int ret = UNKNOWN;
+    eReturnValues ret = UNKNOWN;
     nvmeFeaturesCmdOpt featureCmd;
 #ifdef _DEBUG
     printf("-->%s\n", __FUNCTION__);
 #endif
     memset(&featureCmd, 0, sizeof(nvmeFeaturesCmdOpt));
     featureCmd.fid = NVME_FEAT_WRITE_ATOMIC_;
-    featureCmd.sel = selectType;
+    featureCmd.sel = C_CAST(uint8_t, selectType);
     ret = nvme_Get_Features(device, &featureCmd);
     if (ret == SUCCESS)
     {
@@ -340,16 +386,16 @@ int nvme_Print_Write_Atomicity_Feature_Details(tDevice *device, eNvmeFeaturesSel
 }
 
 //Asynchronous Event Configuration (0Bh Feature)
-int nvme_Print_Async_Config_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue selectType)
+static eReturnValues nvme_Print_Async_Config_Feature_Details(tDevice *device, eNvmeFeaturesSelectValue selectType)
 {
-    int ret = UNKNOWN;
+    eReturnValues ret = UNKNOWN;
     nvmeFeaturesCmdOpt featureCmd;
 #ifdef _DEBUG
     printf("-->%s\n", __FUNCTION__);
 #endif
     memset(&featureCmd, 0, sizeof(nvmeFeaturesCmdOpt));
     featureCmd.fid = NVME_FEAT_ASYNC_EVENT_;
-    featureCmd.sel = selectType;
+    featureCmd.sel = C_CAST(uint8_t, selectType);
     ret = nvme_Get_Features(device, &featureCmd);
     if (ret == SUCCESS)
     {
@@ -365,9 +411,66 @@ int nvme_Print_Async_Config_Feature_Details(tDevice *device, eNvmeFeaturesSelect
     return ret;
 }
 
-int nvme_Print_Feature_Details(tDevice *device, uint8_t featureID, eNvmeFeaturesSelectValue selectType)
+static eReturnValues nvme_Print_HMB_Feature_Info(tDevice* device, eNvmeFeaturesSelectValue selectType)
 {
-    int ret = UNKNOWN;
+    eReturnValues ret = UNKNOWN;
+    DECLARE_ZERO_INIT_ARRAY(uint8_t, hmbData, 4096);
+    nvmeFeaturesCmdOpt featureCmd;
+#ifdef _DEBUG
+    printf("-->%s\n", __FUNCTION__);
+#endif
+    memset(&featureCmd, 0, sizeof(nvmeFeaturesCmdOpt));
+    featureCmd.fid = NVME_FEAT_HOST_MEMORY_BUFFER_;
+    featureCmd.sel = C_CAST(uint8_t, selectType);
+    featureCmd.dataPtr = hmbData;
+    featureCmd.dataLength = 4096;
+    ret = nvme_Get_Features(device, &featureCmd);
+    if (ret == SUCCESS)
+    {
+        double hmbRec = C_CAST(double, device->drive_info.IdentifyData.nvme.ctrl.hmpre) * 4096.0;
+        double hmbMin = C_CAST(double, device->drive_info.IdentifyData.nvme.ctrl.hmmin) * 4096.0;
+        DECLARE_ZERO_INIT_ARRAY(char, hmbRecUnits, UNIT_STRING_LENGTH);
+        DECLARE_ZERO_INIT_ARRAY(char, hmbMinUnits, UNIT_STRING_LENGTH);
+        char* hmbRecUnit = &hmbRecUnits[0];
+        char *hmbMinUnit = &hmbMinUnits[0];
+        capacity_Unit_Convert(&hmbRec, &hmbRecUnit);
+        capacity_Unit_Convert(&hmbMin, &hmbMinUnit);
+        printf("\n\tHost Memory Buffer Info\n");
+        printf("=============================================\n");
+        //these two are from identify
+        printf("HMB Recommended Size: %0.2f %s\n", hmbRec, hmbRecUnit);
+        printf("HMB Minimum Size: %0.2f %s\n", hmbMin, hmbMinUnit);
+        //remaining come from cmd results or output data
+        printf("Enable Host Memory     :\t%s\n", (featureCmd.featSetGetValue & BIT0) ? "Enabled" : "Disabled");
+        printf("\tHMB Attributes:\n");
+        uint32_t hsize = M_BytesTo4ByteValue(hmbData[3], hmbData[2], hmbData[1], hmbData[0]);
+        uint64_t hmbDLA = M_BytesTo8ByteValue(hmbData[11], hmbData[10], hmbData[9], hmbData[8], hmbData[7], hmbData[6], hmbData[5], hmbData[4]);
+        uint32_t hmdlec = M_BytesTo4ByteValue(hmbData[15], hmbData[14], hmbData[13], hmbData[12]);
+        size_t pageSize = get_System_Pagesize();
+        if (pageSize > 0)
+        {
+            double hmbAllocedSize = C_CAST(double, hsize * pageSize);
+            DECLARE_ZERO_INIT_ARRAY(char, hmbAllocedUnits, UNIT_STRING_LENGTH);
+            char* hmbAllocedUnit = &hmbAllocedUnits[0];
+            capacity_Unit_Convert(&hmbAllocedSize, &hmbAllocedUnit);
+            printf("\t\tBuffer size: %0.02f %s\n", hmbAllocedSize, hmbAllocedUnit);
+        }
+        else
+        {
+            printf("\t\tBuffer size (memory page size units): %" PRIu32 "\n", hsize);
+        }
+        printf("\t\tHost Memory Descriptor List Address: %" PRIX64 "h\n", hmbDLA);
+        printf("\t\tMemory descriptor list count: %" PRIu32 "\n", hmdlec);
+    }
+#ifdef _DEBUG
+    printf("<--%s (%d)\n", __FUNCTION__, ret);
+#endif
+    return ret;
+}
+
+eReturnValues nvme_Print_Feature_Details(tDevice *device, uint8_t featureID, eNvmeFeaturesSelectValue selectType)
+{
+    eReturnValues ret = UNKNOWN;
 #ifdef _DEBUG
     printf("-->%s\n", __FUNCTION__);
 #endif
@@ -403,6 +506,9 @@ int nvme_Print_Feature_Details(tDevice *device, uint8_t featureID, eNvmeFeatures
     case NVME_FEAT_ASYNC_EVENT_:
         ret = nvme_Print_Async_Config_Feature_Details(device, selectType);
         break;
+    case NVME_FEAT_HOST_MEMORY_BUFFER_:
+        ret = nvme_Print_HMB_Feature_Info(device, selectType);
+        break;
     default:
         ret = NOT_SUPPORTED;
         break;
@@ -413,36 +519,167 @@ int nvme_Print_Feature_Details(tDevice *device, uint8_t featureID, eNvmeFeatures
     return ret;
 }
 
-int nvme_Get_Log_Size(uint8_t logPageId, uint64_t * logSize)
+//This function just returns maximum sizes as best it can
+//      It needs to also check if a given page is supported as well, which is....complicated
+//      Older devices won't have the supported pages LID, but newer will
+//      Additionally we may need to check for specific features or other bits to determine what is or is not supported.
+eReturnValues nvme_Get_Log_Size(tDevice *device, uint8_t logPageId, uint64_t * logSize)
 {
-    switch (logPageId)
+    eReturnValues ret = SUCCESS;
+    if (logSize)
     {
-    case NVME_LOG_ERROR_ID:
-        *logSize = sizeof(nvmeErrLogEntry);
+        DECLARE_ZERO_INIT_ARRAY(uint8_t, logPageHeader, UINT32_C(16));
+        nvmeGetLogPageCmdOpts getLogHeader;
+        memset(&getLogHeader, 0, sizeof(nvmeGetLogPageCmdOpts));
+        getLogHeader.addr = logPageHeader;
+        getLogHeader.dataLen = UINT32_C(16);
+        getLogHeader.nsid = NVME_ALL_NAMESPACES;//change this as needed when calculating sizes below
+        getLogHeader.rae = true;//do not clear any asynchronous events
+        *logSize = UINT64_C(0);//make sure this is initialized to zero as some logs below may require calculating the size by reading info from the drive
+        switch (logPageId)
+        {
+        case NVME_LOG_FETURE_IDENTIFIERS_SUPPORTED_AND_EFFECTS_ID:
+        case NVME_LOG_SUPPORTED_PAGES_ID:
+            *logSize = UINT64_C(1024);
+            break;
+        case NVME_LOG_ERROR_ID:
+            *logSize = UINT64_C(64) * C_CAST(uint64_t, device->drive_info.IdentifyData.nvme.ctrl.elpe);
+            break;
+        case NVME_LOG_SMART_ID:
+        case NVME_LOG_FW_SLOT_ID:
+        case NVME_LOG_ENDURANCE_GROUP_INFO_ID:
+        case NVME_LOG_PREDICTABLE_LATENCY_PER_NVM_SET_ID:
+        case NVME_LOG_COMMAND_AND_FEATURE_LOCKDOWN_ID:
+        case NVME_LOG_ROTATIONAL_MEDIA_INFORMATION_ID:
+        case NVME_LOG_SANITIZE_ID:
+            *logSize = UINT64_C(512);
+            break;
+        case NVME_LOG_MN_COMMANDS_SUPPORTED_AND_EFFECTS_ID:
+        case NVME_LOG_CHANGED_NAMESPACE_LIST://up to 1024 entries of namespaces...just returning the maximum size
+        case NVME_LOG_CMD_SPT_EFET_ID:
+            *logSize = UINT64_C(4096);
+            break;
+        case NVME_LOG_DEV_SELF_TEST_ID:
+            *logSize = UINT64_C(564);
+            break;
+        case NVME_LOG_TELEMETRY_HOST_ID:
+        case NVME_LOG_TELEMETRY_CTRL_ID:
+        {
+            DECLARE_ZERO_INIT_ARRAY(uint8_t, telemetryHeader, UINT32_C(512));
+            getLogHeader.addr = telemetryHeader;
+            getLogHeader.dataLen = UINT32_C(512);
+            getLogHeader.lid = logPageId;
+            if (SUCCESS == nvme_Get_Log_Page(device, &getLogHeader))
+            {
+                *logSize = UINT64_C(512) + (UINT64_C(512) * M_BytesTo2ByteValue(logPageHeader[13], logPageHeader[12]));
+                //TODO: Data area 4 support. Need to check host behavior support feature as well as identify data
+                /*if (device->drive_info.IdentifyData.nvme.ctrl.lpa & BIT6)
+                {
+                    //use data area 4
+                }*/
+            }
+            else
+            {
+                //requested telemetry log is likely not supported
+                *logSize = UINT64_C(0);
+            }
+        }
         break;
-    case NVME_LOG_SMART_ID:
-    case NVME_LOG_FW_SLOT_ID: //Same size as Health
-        *logSize = NVME_SMART_HEALTH_LOG_LEN;
-        break;
-    case NVME_LOG_CMD_SPT_EFET_ID:
-        *logSize = sizeof(nvmeEffectsLog);
-        break;
-    case NVME_LOG_DEV_SELF_TEST:
-        *logSize = sizeof(nvmeSelfTestLog);
-        break;
-    default:
-        *logSize = 0;
-        break;
+        case NVME_LOG_PREDICTABLE_LATENCY_EVENT_AGREGATE_ID:
+            *logSize = UINT64_C(8) + (UINT64_C(2) * C_CAST(uint64_t, device->drive_info.IdentifyData.nvme.ctrl.nsetidmax));
+            break;
+        case NVME_LOG_ASYMMETRIC_NAMESPACE_ACCESS_ID:
+            //ANAGRPMAX for maximum value
+            //NANAGRPID for number of ANA groups supported by the controller
+            //16B header for the log
+            //each group descriptor is 32B + (number of NSIDs * 4) B in length
+            //So the maximum size this log could be is calculated in this section as:
+            //16 + (ANAGRPMAX * (32 + (ctrlNN * 4)))
+            getLogHeader.lid = NVME_LOG_ASYMMETRIC_NAMESPACE_ACCESS_ID;
+            if (SUCCESS == nvme_Get_Log_Page(device, &getLogHeader))
+            {
+                uint16_t numberOfANAGroupDescriptors = M_BytesTo2ByteValue(logPageHeader[9], logPageHeader[8]);
+                *logSize = UINT64_C(16) + (numberOfANAGroupDescriptors * (UINT64_C(32) + (C_CAST(uint64_t, device->drive_info.IdentifyData.nvme.ctrl.nn) * UINT64_C(4))));
+            }
+            //old maximum size calculation:
+            //*logSize = UINT64_C(16) + (C_CAST(uint64_t, device->drive_info.IdentifyData.nvme.ctrl.anagrpmax) * (UINT64_C(32) + (C_CAST(uint64_t, device->drive_info.IdentifyData.nvme.ctrl.nn) * UINT64_C(4))));
+            break;
+        case NVME_LOG_PERSISTENT_EVENT_LOG_ID:
+            //512B header, each event is24B + vendor specific info (max 65535B) + event data
+            //PELS is maximum persistent events in 64KiB units
+            *logSize = C_CAST(uint64_t, device->drive_info.IdentifyData.nvme.ctrl.pels) * UINT64_C(65536);
+            break;
+        case NVME_LOG_ENDURANCE_GROUP_EVENT_AGREGATE_ID:
+            *logSize = UINT64_C(8) + (C_CAST(uint64_t, device->drive_info.IdentifyData.nvme.ctrl.endgidmax) * UINT64_C(2));
+            break;
+        case NVME_LOG_MEDIA_UNIT_STATUS_ID:
+            //Read the first 16B to get NMU and CCHANS to figure out the total size
+            //Selected Configuration will play a part in the size calculation as well. If zero, MUCS in each descriptor will be zero
+            getLogHeader.lid = NVME_LOG_MEDIA_UNIT_STATUS_ID;
+            if (SUCCESS == nvme_Get_Log_Page(device, &getLogHeader))
+            {
+                uint16_t nmu = M_BytesTo2ByteValue(logPageHeader[1], logPageHeader[0]);
+                uint16_t cchans = M_BytesTo2ByteValue(logPageHeader[3], logPageHeader[2]);
+                uint16_t selectedConfiguration = M_BytesTo2ByteValue(logPageHeader[5], logPageHeader[4]);
+                if (selectedConfiguration)
+                {
+                    //no channels in media unit status descriptor
+                    *logSize = UINT64_C(16)/*log header*/ + (nmu * UINT64_C(16)/*descriptor header bytes*/);
+                }
+                else
+                {
+                    //This assumes channel 0 will start at offset 16...this is not required by the spec, just that it's a multiple of 16
+                    *logSize = UINT64_C(16)/*log header*/ + (nmu * (UINT64_C(16)/*descriptor header bytes*/ + (cchans * UINT64_C(2)/*bytes per channel identifier*/)));
+                }
+            }
+            break;
+        case NVME_LOG_SUPPORTED_CAPACITY_CONFIGURATION_LIST_ID:
+            //TODO: read 16B header to get SCCN. NOTE: configuration descriptors can be different lengths...this is due to number of endurance groups accessible by the controller.
+            //Each is variable by number of endurance groups, number NVM sets, number of channels and number of media units. Talk about complicated.
+            *logSize = UINT64_C(0);
+            break;
+        case NVME_LOG_BOOT_PARTITION_ID:
+            //read 16B header to get boot partition data size and calculate this
+            getLogHeader.lid = NVME_LOG_BOOT_PARTITION_ID;
+            if (SUCCESS == nvme_Get_Log_Page(device, &getLogHeader))
+            {
+                uint32_t bootPartitionInfo = M_BytesTo4ByteValue(logPageHeader[7], logPageHeader[6], logPageHeader[5], logPageHeader[4]);
+                *logSize = UINT64_C(16) + (UINT64_C(131072)/*128KiB units*/ * M_GETBITRANGE(bootPartitionInfo, 14, 0)/*boot partition count*/);
+            }
+            break;
+        case NVME_LOG_DISCOVERY_ID:
+            //NOTE: Using first 16B for now. Change if record format ever changes to read more info to properly determine the size
+            getLogHeader.lid = NVME_LOG_DISCOVERY_ID;
+            if (SUCCESS == nvme_Get_Log_Page(device, &getLogHeader))
+            {
+                uint64_t numberOfRecords = M_BytesTo8ByteValue(logPageHeader[15], logPageHeader[14], logPageHeader[13], logPageHeader[12], logPageHeader[11], logPageHeader[10], logPageHeader[9], logPageHeader[8]);
+                *logSize = UINT64_C(1024) + (numberOfRecords * UINT64_C(1024));
+            }
+            break;
+        case NVME_LOG_RESERVATION_ID:
+            *logSize = UINT64_C(64);
+            break;
+        case NVME_LOG_COMMAND_SET_SPECIFIC_ID:
+        default:
+            //Unknown log ID
+            //Set ret to something else for unknown size???
+            *logSize = UINT64_C(0);
+            break;
+        }
     }
-    return SUCCESS; // Can be used later to tell if the log is unavailable or we can't get size. 
+    else
+    {
+        ret = BAD_PARAMETER;
+    }
+    return ret;
 }
 
-int nvme_Print_FWSLOTS_Log_Page(tDevice *device)
+eReturnValues nvme_Print_FWSLOTS_Log_Page(tDevice *device)
 {
-    int ret = UNKNOWN;
+    eReturnValues ret = UNKNOWN;
     int slot = 0;
     nvmeFirmwareSlotInfo fwSlotsLogInfo;
-    char fwRev[9]; // 8 bytes for the FSR + 1 byte '\0'
+    DECLARE_ZERO_INIT_ARRAY(char, fwRev, 9);
 #ifdef _DEBUG
     printf("-->%s\n", __FUNCTION__);
 #endif
@@ -453,14 +690,25 @@ int nvme_Print_FWSLOTS_Log_Page(tDevice *device)
 #ifdef _DEBUG
         printf("AFI: 0x%X\n", fwSlotsLogInfo.afi);
 #endif
-        printf("\nFirmware slot actively running firmware: %d\n", fwSlotsLogInfo.afi & 0x03);
-        printf("Firmware slot to be activated at next reset: %d\n\n", ((fwSlotsLogInfo.afi & 0x30) >> 4));
+        printf("\nFirmware slot actively running firmware: %d\n", fwSlotsLogInfo.afi & 0x07);
+
+        if (((fwSlotsLogInfo.afi & 0x70) >> 4) == 0)
+        {
+            printf("Firmware slot to be activated at next reset: None\n\n");
+        }
+        else
+        {
+            printf("Firmware slot to be activated at next reset: %d\n\n", ((fwSlotsLogInfo.afi & 0x70) >> 4));
+        }
 
         for (slot = 1; slot <= NVME_MAX_FW_SLOTS; slot++)
         {
-            memcpy(fwRev, (char *)&fwSlotsLogInfo.FSR[slot - 1], 8);
-            fwRev[8] = '\0';
-            printf(" Slot %d : %s\n", slot, fwRev);
+            if (fwSlotsLogInfo.FSR[slot - 1])
+            {
+                memcpy(fwRev, (char *)&fwSlotsLogInfo.FSR[slot - 1], 8);
+                fwRev[8] = '\0';
+                printf(" Slot %d : %s\n", slot, fwRev);
+            }
         }
     }
 
@@ -491,9 +739,9 @@ void show_effects_log_human(uint32_t effect)
         printf("  Reserved CSE\n");
 }
 
-int nvme_Print_CmdSptEfft_Log_Page(tDevice *device)
+eReturnValues nvme_Print_CmdSptEfft_Log_Page(tDevice *device)
 {
-    int ret = UNKNOWN;
+    eReturnValues ret = UNKNOWN;
     nvmeEffectsLog effectsLogInfo;
     uint16_t i = 0;
     uint32_t effect = 0;
@@ -535,9 +783,9 @@ int nvme_Print_CmdSptEfft_Log_Page(tDevice *device)
 }
 
 
-int nvme_Print_DevSelfTest_Log_Page(tDevice *device)
+eReturnValues nvme_Print_DevSelfTest_Log_Page(tDevice *device)
 {
-    int ret = UNKNOWN;
+    eReturnValues ret = UNKNOWN;
     nvmeSelfTestLog selfTestLogInfo;
     int i, temp;
     const char *test_code_res;
@@ -624,11 +872,11 @@ int nvme_Print_DevSelfTest_Log_Page(tDevice *device)
     return ret;
 }
 
-int nvme_Print_ERROR_Log_Page(tDevice *device, uint64_t numOfErrToPrint)
+eReturnValues nvme_Print_ERROR_Log_Page(tDevice *device, uint64_t numOfErrToPrint)
 {
-    int ret = UNKNOWN;
+    eReturnValues ret = UNKNOWN;
     int err = 0;
-    nvmeErrLogEntry * pErrLogBuf = NULL;
+    nvmeErrLogEntry * pErrLogBuf = M_NULLPTR;
 #ifdef _DEBUG
     printf("-->%s\n", __FUNCTION__);
 #endif
@@ -637,8 +885,8 @@ int nvme_Print_ERROR_Log_Page(tDevice *device, uint64_t numOfErrToPrint)
     {
         numOfErrToPrint = 32;
     }
-    pErrLogBuf = C_CAST(nvmeErrLogEntry *, calloc_aligned(C_CAST(size_t, numOfErrToPrint), sizeof(nvmeErrLogEntry), device->os_info.minimumAlignment));
-    if (pErrLogBuf != NULL)
+    pErrLogBuf = C_CAST(nvmeErrLogEntry *, safe_calloc_aligned(C_CAST(size_t, numOfErrToPrint), sizeof(nvmeErrLogEntry), device->os_info.minimumAlignment));
+    if (pErrLogBuf != M_NULLPTR)
     {
         ret = nvme_Get_ERROR_Log_Page(device, C_CAST(uint8_t*, pErrLogBuf), C_CAST(uint32_t, numOfErrToPrint * sizeof(nvmeErrLogEntry)));
         if (ret == SUCCESS)
@@ -650,7 +898,7 @@ int nvme_Print_ERROR_Log_Page(tDevice *device, uint64_t numOfErrToPrint)
                 if (pErrLogBuf[err].errorCount)
                 {
 
-                    printf("%"PRIu64"\t%"PRIu64"\t%"PRIu16"\t%"PRIu16"\t0x%02"PRIX16"\t0x%02"PRIX16"\n", \
+                    printf("%" PRIu64 "\t%" PRIu64 "\t%" PRIu16 "\t%" PRIu16 "\t0x%02"PRIX16"\t0x%02"PRIX16"\n", \
                         pErrLogBuf[err].errorCount,
                         pErrLogBuf[err].lba,
                         pErrLogBuf[err].subQueueID,
@@ -661,16 +909,16 @@ int nvme_Print_ERROR_Log_Page(tDevice *device, uint64_t numOfErrToPrint)
             }
         }
     }
-    safe_Free_aligned(pErrLogBuf)
+    safe_Free_aligned(C_CAST(void**, &pErrLogBuf));
 #ifdef _DEBUG
     printf("<--%s (%d)\n", __FUNCTION__, ret);
 #endif
     return ret;
 }
 
-int print_Nvme_Ctrl_Regs(tDevice * device)
+eReturnValues print_Nvme_Ctrl_Regs(tDevice * device)
 {
-    int ret = UNKNOWN;
+    eReturnValues ret = UNKNOWN;
 
     nvmeBarCtrlRegisters ctrlRegs;
 
@@ -682,7 +930,7 @@ int print_Nvme_Ctrl_Regs(tDevice * device)
 
     if (ret == SUCCESS)
     {
-        printf("Controller Capabilities (CAP)\t:\t%"PRIx64"\n", ctrlRegs.cap);
+        printf("Controller Capabilities (CAP)\t:\t%" PRIx64 "\n", ctrlRegs.cap);
         printf("Version (VS)\t:\t0x%x\n", ctrlRegs.vs);
         printf("Interrupt Mask Set (INTMS)\t:\t0x%x\n", ctrlRegs.intms);
         printf("Interrupt Mask Clear (INTMC)\t:\t0x%x\n", ctrlRegs.intmc);
@@ -690,8 +938,8 @@ int print_Nvme_Ctrl_Regs(tDevice * device)
         printf("Controller Status (CSTS)\t:\t0x%x\n", ctrlRegs.csts);
         //What about NSSR?
         printf("Admin Queue Attributes (AQA)\t:\t0x%x\n", ctrlRegs.aqa);
-        printf("Admin Submission Queue Base Address (ASQ)\t:\t%"PRIx64"\n", ctrlRegs.asq);
-        printf("Admin Completion Queue Base Address (ACQ)\t:\t%"PRIx64"\n", ctrlRegs.acq);
+        printf("Admin Submission Queue Base Address (ASQ)\t:\t%" PRIx64 "\n", ctrlRegs.asq);
+        printf("Admin Completion Queue Base Address (ACQ)\t:\t%" PRIx64 "\n", ctrlRegs.acq);
     }
     else
     {
@@ -699,422 +947,3 @@ int print_Nvme_Ctrl_Regs(tDevice * device)
     }
     return ret;
 }
-
-/***************************************
-* Extended-SMART Information
-***************************************/
-char* print_ext_smart_id(uint8_t attrId)
-{
-    switch (attrId) {
-    case VS_ATTR_ID_SOFT_READ_ERROR_RATE:
-        return "Soft ECC error count";
-    case VS_ATTR_ID_REALLOCATED_SECTOR_COUNT:
-        return "Bad NAND block count";
-    case VS_ATTR_ID_POWER_ON_HOURS:
-        return "Power On Hours";
-    case VS_ATTR_ID_POWER_FAIL_EVENT_COUNT:
-        return "Power Fail Event Count";
-    case VS_ATTR_ID_DEVICE_POWER_CYCLE_COUNT:
-        return "Device Power Cycle Count";
-    case VS_ATTR_ID_RAW_READ_ERROR_RATE:
-        return "Uncorrectable read error count";
-        /**********************************************
-                case 30:
-                    return "LIFETIME_WRITES0_TO_FLASH";
-                case 31:
-                    return "LIFETIME_WRITES1_TO_FLASH";
-                case 32:
-                    return "LIFETIME_WRITES0_FROM_HOST";
-                case 33:
-                    return "LIFETIME_WRITES1_FROM_HOST";
-                case 34:
-                    return "LIFETIME_READ0_FROM_HOST";
-                case 35:
-                    return "LIFETIME_READ1_FROM_HOST";
-                case 36:
-                    return "PCIE_PHY_CRC_ERROR";
-                case 37:
-                    return "BAD_BLOCK_COUNT_SYSTEM";
-                case 38:
-                    return "BAD_BLOCK_COUNT_USER";
-                case 39:
-                    return "THERMAL_THROTTLING_STATUS";
-        **********************************************/
-    case VS_ATTR_ID_GROWN_BAD_BLOCK_COUNT:
-        return "Bad NAND block count";
-    case VS_ATTR_ID_END_2_END_CORRECTION_COUNT:
-        return "SSD End to end correction counts";
-    case VS_ATTR_ID_MIN_MAX_WEAR_RANGE_COUNT:
-        return "User data erase counts";
-    case VS_ATTR_ID_REFRESH_COUNT:
-        return "Refresh count";
-    case VS_ATTR_ID_BAD_BLOCK_COUNT_USER:
-        return "User data erase fail count";
-    case VS_ATTR_ID_BAD_BLOCK_COUNT_SYSTEM:
-        return "System area erase fail count";
-    case VS_ATTR_ID_THERMAL_THROTTLING_STATUS:
-        return "Thermal throttling status and count";
-    case VS_ATTR_ID_ALL_PCIE_CORRECTABLE_ERROR_COUNT:
-        return "PCIe Correctable Error count";
-    case VS_ATTR_ID_ALL_PCIE_UNCORRECTABLE_ERROR_COUNT:
-        return "PCIe Uncorrectable Error count";
-    case VS_ATTR_ID_INCOMPLETE_SHUTDOWN_COUNT:
-        return "Incomplete shutdowns";
-    case VS_ATTR_ID_GB_ERASED_LSB:
-        return "LSB of Flash GB erased";
-    case VS_ATTR_ID_GB_ERASED_MSB:
-        return "MSB of Flash GB erased";
-    case VS_ATTR_ID_LIFETIME_DEVSLEEP_EXIT_COUNT:
-        return "LIFETIME_DEV_SLEEP_EXIT_COUNT";
-    case VS_ATTR_ID_LIFETIME_ENTERING_PS4_COUNT:
-        return "LIFETIME_ENTERING_PS4_COUNT";
-    case VS_ATTR_ID_LIFETIME_ENTERING_PS3_COUNT:
-        return "LIFETIME_ENTERING_PS3_COUNT";
-    case VS_ATTR_ID_RETIRED_BLOCK_COUNT:
-        return "Retired block count"; /*VS_ATTR_ID_RETIRED_BLOCK_COUNT*/
-    case VS_ATTR_ID_PROGRAM_FAILURE_COUNT:
-        return "Program fail count";
-    case VS_ATTR_ID_ERASE_FAIL_COUNT:
-        return "Erase Fail Count";
-    case VS_ATTR_ID_AVG_ERASE_COUNT:
-        return "System data % used";
-    case VS_ATTR_ID_UNEXPECTED_POWER_LOSS_COUNT:
-        return "Unexpected power loss count";
-    case VS_ATTR_ID_WEAR_RANGE_DELTA:
-        return "Wear range delta";
-    case VS_ATTR_ID_SATA_INTERFACE_DOWNSHIFT_COUNT:
-        return "PCIE_INTF_DOWNSHIFT_COUNT";
-    case VS_ATTR_ID_END_TO_END_CRC_ERROR_COUNT:
-        return "E2E_CRC_ERROR_COUNT";
-    case VS_ATTR_ID_UNCORRECTABLE_ECC_ERRORS:
-        return "Soft ECC error count";
-    case VS_ATTR_ID_MAX_LIFE_TEMPERATURE:
-        return "Max lifetime temperature";/*VS_ATTR_ID_MAX_LIFE_TEMPERATURE for extended*/
-    case VS_ATTR_ID_RAISE_ECC_CORRECTABLE_ERROR_COUNT:
-        return "RAIS_ECC_CORRECT_ERR_COUNT";
-    case VS_ATTR_ID_UNCORRECTABLE_RAISE_ERRORS:
-        return "Uncorrectable read error count";/*VS_ATTR_ID_UNCORRECTABLE_RAISE_ERRORS*/
-    case VS_ATTR_ID_DRIVE_LIFE_PROTECTION_STATUS:
-        return "DRIVE_LIFE_PROTECTION_STATUS";
-    case VS_ATTR_ID_REMAINING_SSD_LIFE:
-        return "Remaining SSD life";
-    case VS_ATTR_ID_LIFETIME_WRITES_TO_FLASH_LSB:
-        return "LSB of Physical (NAND) bytes written";
-    case VS_ATTR_ID_LIFETIME_WRITES_TO_FLASH_MSB:
-        return "MSB of Physical (NAND) bytes written";
-    case VS_ATTR_ID_LIFETIME_WRITES_FROM_HOST_LSB:
-        return "LSB of Physical (HOST) bytes written";
-    case VS_ATTR_ID_LIFETIME_WRITES_FROM_HOST_MSB:
-        return "MSB of Physical (HOST) bytes written";
-    case VS_ATTR_ID_LIFETIME_READS_TO_HOST_LSB:
-        return "LSB of Physical (NAND) bytes read";
-    case VS_ATTR_ID_LIFETIME_READS_TO_HOST_MSB:
-        return "MSB of Physical (NAND) bytes read";
-    case VS_ATTR_ID_FREE_SPACE:
-        return "Free Space";
-    case VS_ATTR_ID_TRIM_COUNT_LSB:
-        return "LSB of Trim count";
-    case VS_ATTR_ID_TRIM_COUNT_MSB:
-        return "MSB of Trim count";
-    case VS_ATTR_ID_OP_PERCENTAGE:
-        return "OP percentage";
-    case VS_ATTR_ID_MAX_SOC_LIFE_TEMPERATURE:
-        return "Max lifetime SOC temperature";
-    default:
-        return "Un-Known";
-    }
-}
-
-uint64_t smart_attribute_vs(uint16_t verNo, SmartVendorSpecific attr)
-{
-    uint64_t val = 0;
-    fb_smart_attribute_data *attrFb;
-
-    /**
-     * These are all FaceBook specific attributes.
-     */
-    if (verNo >= EXTENDED_SMART_VERSION_FB) {
-        attrFb = (fb_smart_attribute_data *)&attr;
-        val = attrFb->MSDword;
-        val = (val << 32) | attrFb->LSDword;
-        return val;
-    }
-
-    /******************************************************************
-        if(attr.AttributeNumber == VS_ATTR_POWER_CONSUMPTION) {
-            attrFb = (fb_smart_attribute_data *)&attr;
-            return attrFb->LSDword;
-        }
-        else if(attr.AttributeNumber == VS_ATTR_THERMAL_THROTTLING_STATUS) {
-            fb_smart_attribute_data *attrFb;
-            attrFb = (fb_smart_attribute_data *)&attr;
-            return attrFb->LSDword;
-        }
-        else if(attr.AttributeNumber == VS_ATTR_PCIE_PHY_CRC_ERROR) {
-            fb_smart_attribute_data *attrFb;
-            attrFb = (fb_smart_attribute_data *)&attr;
-            return attrFb->LSDword;
-        }
-        else if(attr.AttributeNumber == VS_ATTR_BAD_BLOCK_COUNT_USER) {
-            fb_smart_attribute_data *attrFb;
-            attrFb = (fb_smart_attribute_data *)&attr;
-            return attrFb->LSDword;
-        }
-        else if(attr.AttributeNumber == VS_ATTR_BAD_BLOCK_COUNT_SYSTEM) {
-            fb_smart_attribute_data *attrFb;
-            attrFb = (fb_smart_attribute_data *)&attr;
-            return attrFb->LSDword;
-        }
-        else if(attr.AttributeNumber == VS_ATTR_LIFETIME_READ1_FROM_HOST) {
-            fb_smart_attribute_data *attrFb;
-            attrFb = (fb_smart_attribute_data *)&attr;
-            val = attrFb->MSDword;
-            val = (val << 32) | attrFb->LSDword ;
-            return val;
-        }
-        else if(attr.AttributeNumber == VS_ATTR_LIFETIME_READ0_FROM_HOST) {
-            fb_smart_attribute_data *attrFb;
-            attrFb = (fb_smart_attribute_data *)&attr;
-            val = attrFb->MSDword;
-            val = (val << 32) | attrFb->LSDword ;
-            return val;
-        }
-        else if(attr.AttributeNumber == VS_ATTR_LIFETIME_WRITES1_FROM_HOST) {
-            fb_smart_attribute_data *attrFb;
-            attrFb = (fb_smart_attribute_data *)&attr;
-            val = attrFb->MSDword;
-            val = (val << 32) | attrFb->LSDword ;
-            return val;
-        }
-        else if(attr.AttributeNumber == VS_ATTR_LIFETIME_WRITES0_FROM_HOST) {
-            fb_smart_attribute_data *attrFb;
-            attrFb = (fb_smart_attribute_data *)&attr;
-            val = attrFb->MSDword;
-            val = (val << 32) | attrFb->LSDword ;
-            return val;
-        }
-        else if(attr.AttributeNumber == VS_ATTR_LIFETIME_WRITES1_TO_FLASH) {
-            fb_smart_attribute_data *attrFb;
-            attrFb = (fb_smart_attribute_data *)&attr;
-            val = attrFb->MSDword;
-            val = (val << 32) | attrFb->LSDword ;
-            return val;
-        }
-        else if(attr.AttributeNumber == VS_ATTR_LIFETIME_WRITES0_TO_FLASH) {
-            fb_smart_attribute_data *attrFb;
-            attrFb = (fb_smart_attribute_data *)&attr;
-            val = attrFb->MSDword;
-            val = (val << 32) | attrFb->LSDword ;
-            return val;
-        }
-    ******************************************************************/
-
-    else
-        return attr.Raw0_3;
-}
-
-
-
-void print_smart_log(uint16_t verNo, SmartVendorSpecific attr, int lastAttr)
-{
-    static uint64_t lsbGbErased = 0, msbGbErased = 0, lsbLifWrtToFlash = 0, msbLifWrtToFlash = 0, lsbLifWrtFrmHost = 0, msbLifWrtFrmHost = 0, lsbLifRdToHost = 0, msbLifRdToHost = 0, lsbTrimCnt = 0, msbTrimCnt = 0;
-    char buf[40] = { 0 };
-#define NVME_PRINT_SMART_LOG_STRING_BUFFER_LENGTH 35
-    char strBuf[NVME_PRINT_SMART_LOG_STRING_BUFFER_LENGTH] = { 0 };
-    int hideAttr = 0;
-
-    if (attr.AttributeNumber == VS_ATTR_ID_GB_ERASED_LSB)
-    {
-        lsbGbErased = smart_attribute_vs(verNo, attr);
-        hideAttr = 1;
-    }
-
-    if (attr.AttributeNumber == VS_ATTR_ID_GB_ERASED_MSB)
-    {
-        msbGbErased = smart_attribute_vs(verNo, attr);
-        hideAttr = 1;
-    }
-
-    if (attr.AttributeNumber == VS_ATTR_ID_LIFETIME_WRITES_TO_FLASH_LSB)
-    {
-        lsbLifWrtToFlash = smart_attribute_vs(verNo, attr);
-        hideAttr = 1;
-    }
-
-    if (attr.AttributeNumber == VS_ATTR_ID_LIFETIME_WRITES_TO_FLASH_MSB)
-    {
-        msbLifWrtToFlash = smart_attribute_vs(verNo, attr);
-        hideAttr = 1;
-    }
-
-    if (attr.AttributeNumber == VS_ATTR_ID_LIFETIME_WRITES_FROM_HOST_LSB)
-    {
-        lsbLifWrtFrmHost = smart_attribute_vs(verNo, attr);
-        hideAttr = 1;
-    }
-
-    if (attr.AttributeNumber == VS_ATTR_ID_LIFETIME_WRITES_FROM_HOST_MSB) {
-        msbLifWrtFrmHost = smart_attribute_vs(verNo, attr);
-        hideAttr = 1;
-    }
-
-    if (attr.AttributeNumber == VS_ATTR_ID_LIFETIME_READS_TO_HOST_LSB) {
-        lsbLifRdToHost = smart_attribute_vs(verNo, attr);
-        hideAttr = 1;
-    }
-
-    if (attr.AttributeNumber == VS_ATTR_ID_LIFETIME_READS_TO_HOST_MSB)
-    {
-        msbLifRdToHost = smart_attribute_vs(verNo, attr);
-        hideAttr = 1;
-    }
-
-    if (attr.AttributeNumber == VS_ATTR_ID_TRIM_COUNT_LSB)
-    {
-        lsbTrimCnt = smart_attribute_vs(verNo, attr);
-        hideAttr = 1;
-    }
-
-    if (attr.AttributeNumber == VS_ATTR_ID_TRIM_COUNT_MSB)
-    {
-        msbTrimCnt = smart_attribute_vs(verNo, attr);
-        hideAttr = 1;
-    }
-
-    if ((attr.AttributeNumber != 0) && (hideAttr != 1)) {
-        printf("%-40s", print_ext_smart_id(attr.AttributeNumber));
-        printf("%-15d", attr.AttributeNumber);
-        printf(" 0x%016" PRIX64 "", smart_attribute_vs(verNo, attr));
-        printf("\n");
-    }
-
-    if (lastAttr == 1) {
-
-        snprintf(strBuf, NVME_PRINT_SMART_LOG_STRING_BUFFER_LENGTH, "%s", (print_ext_smart_id(VS_ATTR_ID_GB_ERASED_LSB) + 7));
-        printf("%-40s", strBuf);
-
-        printf("%-15d", VS_ATTR_ID_GB_ERASED_MSB << 8 | VS_ATTR_ID_GB_ERASED_LSB);
-
-        snprintf(buf, NVME_PRINT_SMART_LOG_STRING_BUFFER_LENGTH, "0x%016" PRIX64 "%016" PRIX64 "", msbGbErased, lsbGbErased);
-        printf(" %s", buf);
-        printf("\n");
-
-        snprintf(strBuf, NVME_PRINT_SMART_LOG_STRING_BUFFER_LENGTH, "%s", (print_ext_smart_id(VS_ATTR_ID_LIFETIME_WRITES_TO_FLASH_LSB) + 7));
-        printf("%-40s", strBuf);
-
-        printf("%-15d", VS_ATTR_ID_LIFETIME_WRITES_TO_FLASH_MSB << 8 | VS_ATTR_ID_LIFETIME_WRITES_TO_FLASH_LSB);
-
-        snprintf(buf, NVME_PRINT_SMART_LOG_STRING_BUFFER_LENGTH, "0x%016" PRIX64 "%016" PRIX64, msbLifWrtToFlash, lsbLifWrtToFlash);
-        printf(" %s", buf);
-        printf("\n");
-
-        snprintf(strBuf, NVME_PRINT_SMART_LOG_STRING_BUFFER_LENGTH, "%s", (print_ext_smart_id(VS_ATTR_ID_LIFETIME_WRITES_FROM_HOST_LSB) + 7));
-        printf("%-40s", strBuf);
-
-        printf("%-15d", VS_ATTR_ID_LIFETIME_WRITES_FROM_HOST_MSB << 8 | VS_ATTR_ID_LIFETIME_WRITES_FROM_HOST_LSB);
-
-        snprintf(buf, NVME_PRINT_SMART_LOG_STRING_BUFFER_LENGTH, "0x%016" PRIX64 "%016" PRIX64, msbLifWrtFrmHost, lsbLifWrtFrmHost);
-        printf(" %s", buf);
-        printf("\n");
-
-        snprintf(strBuf, NVME_PRINT_SMART_LOG_STRING_BUFFER_LENGTH, "%s", (print_ext_smart_id(VS_ATTR_ID_LIFETIME_READS_TO_HOST_LSB) + 7));
-        printf("%-40s", strBuf);
-
-        printf("%-15d", VS_ATTR_ID_LIFETIME_READS_TO_HOST_MSB << 8 | VS_ATTR_ID_LIFETIME_READS_TO_HOST_LSB);
-
-        snprintf(buf, NVME_PRINT_SMART_LOG_STRING_BUFFER_LENGTH, "0x%016" PRIX64 "%016" PRIX64, msbLifRdToHost, lsbLifRdToHost);
-        printf(" %s", buf);
-        printf("\n");
-
-        snprintf(strBuf, NVME_PRINT_SMART_LOG_STRING_BUFFER_LENGTH, "%s", (print_ext_smart_id(VS_ATTR_ID_TRIM_COUNT_LSB) + 7));
-        printf("%-40s", strBuf);
-        printf("%-15d", VS_ATTR_ID_TRIM_COUNT_MSB << 8 | VS_ATTR_ID_TRIM_COUNT_LSB);
-
-        snprintf(buf, NVME_PRINT_SMART_LOG_STRING_BUFFER_LENGTH, "0x%016" PRIX64 "%016" PRIX64, msbTrimCnt, lsbTrimCnt);
-        printf(" %s", buf);
-        printf("\n");
-    }
-}
-
-
-void print_smart_log_CF(fb_log_page_CF *pLogPageCF)
-{
-    uint64_t currentTemp, maxTemp;
-    printf("\n\nSeagate DRAM Supercap SMART Attributes :\n");
-    printf("%-39s %-19s \n", "Description", "Supercap Attributes");
-
-    printf("%-40s", "Super-cap current temperature");
-    currentTemp = pLogPageCF->AttrCF.SuperCapCurrentTemperature;
-    /*currentTemp = currentTemp ? currentTemp - 273 : 0;*/
-    printf(" 0x%016" PRIX64 "", currentTemp);
-    printf("\n");
-
-    maxTemp = pLogPageCF->AttrCF.SuperCapMaximumTemperature;
-    /*maxTemp = maxTemp ? maxTemp - 273 : 0;*/
-    printf("%-40s", "Super-cap maximum temperature");
-    printf(" 0x%016" PRIX64 "", maxTemp);
-    printf("\n");
-
-    printf("%-40s", "Super-cap status");
-    printf(" 0x%016" PRIX64 "", C_CAST(uint64_t, pLogPageCF->AttrCF.SuperCapStatus));
-    printf("\n");
-
-    printf("%-40s", "Data units read to DRAM namespace");
-    printf(" 0x%016" PRIX64 "%016" PRIX64 "", pLogPageCF->AttrCF.DataUnitsReadToDramNamespace.MSU64,
-        pLogPageCF->AttrCF.DataUnitsReadToDramNamespace.LSU64);
-    printf("\n");
-
-    printf("%-40s", "Data units written to DRAM namespace");
-    printf(" 0x%016" PRIX64 "%016" PRIX64 "", pLogPageCF->AttrCF.DataUnitsWrittenToDramNamespace.MSU64,
-        pLogPageCF->AttrCF.DataUnitsWrittenToDramNamespace.LSU64);
-    printf("\n");
-
-    printf("%-40s", "DRAM correctable error count");
-    printf(" 0x%016" PRIX64 "", pLogPageCF->AttrCF.DramCorrectableErrorCount);
-    printf("\n");
-
-    printf("%-40s", "DRAM uncorrectable error count");
-    printf(" 0x%016" PRIX64 "", pLogPageCF->AttrCF.DramUncorrectableErrorCount);
-    printf("\n");
-
-}
-
-//Seagate Unique...
-int get_Ext_Smrt_Log(tDevice *device)//, nvmeGetLogPageCmdOpts * getLogPageCmdOpts)
-{
-#ifdef _DEBUG
-    printf("-->%s\n", __FUNCTION__);
-#endif
-    int ret = 0, index = 0;
-    EXTENDED_SMART_INFO_T ExtdSMARTInfo;
-    memset(&ExtdSMARTInfo, 0x00, sizeof(ExtdSMARTInfo));
-    ret = nvme_Read_Ext_Smt_Log(device, &ExtdSMARTInfo);
-    if (!ret) {
-        printf("%-39s %-15s %-19s \n", "Description", "Ext-Smart-Id", "Ext-Smart-Value");
-        for (index = 0; index < 80; index++)
-            printf("-");
-        printf("\n");
-        for (index = 0; index < NUMBER_EXTENDED_SMART_ATTRIBUTES; index++)
-            print_smart_log(ExtdSMARTInfo.Version, ExtdSMARTInfo.vendorData[index], index == (NUMBER_EXTENDED_SMART_ATTRIBUTES - 1));
-
-    }
-    return 0;
-
-}
-
-int clr_Pcie_Correctable_Errs(tDevice *device)
-{
-    //const char *desc = "Clear Seagate PCIe Correctable counters for the given device ";
-    //const char *save = "specifies that the controller shall save the attribute";
-    int err = SUCCESS;
-
-    nvmeFeaturesCmdOpt clearPCIeCorrectableErrors;
-    memset(&clearPCIeCorrectableErrors, 0, sizeof(nvmeFeaturesCmdOpt));
-    clearPCIeCorrectableErrors.fid = 0xE1;
-    clearPCIeCorrectableErrors.featSetGetValue = 0xCB;
-    clearPCIeCorrectableErrors.sv = false;
-    err = nvme_Set_Features(device, &clearPCIeCorrectableErrors);
-
-    return err;
-}
-#endif//DISABLE_NVME_PASSTHROUGH

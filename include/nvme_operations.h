@@ -1,7 +1,8 @@
+// SPDX-License-Identifier: MPL-2.0
 //
 // Do NOT modify or remove this copyright and license
 //
-// Copyright (c) 2012-2021 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+// Copyright (c) 2012-2024 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
 //
 // This software is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -11,7 +12,6 @@
 // 
 #pragma once
 
-#if !defined(DISABLE_NVME_PASSTHROUGH)
 #include "operations_Common.h"
 #include "nvme_helper.h"
 
@@ -36,7 +36,7 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_OPERATIONS_API int nvme_Print_ERROR_Log_Page(tDevice *device, uint64_t numOfErrToPrint);
+    OPENSEA_OPERATIONS_API eReturnValues nvme_Print_ERROR_Log_Page(tDevice *device, uint64_t numOfErrToPrint);
 
     //-----------------------------------------------------------------------------
     //
@@ -51,7 +51,7 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_OPERATIONS_API int nvme_Print_FWSLOTS_Log_Page(tDevice *device);
+    OPENSEA_OPERATIONS_API eReturnValues nvme_Print_FWSLOTS_Log_Page(tDevice *device);
 
     //-----------------------------------------------------------------------------
     //
@@ -66,7 +66,7 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_OPERATIONS_API int nvme_Print_CmdSptEfft_Log_Page(tDevice *device);
+    OPENSEA_OPERATIONS_API eReturnValues nvme_Print_CmdSptEfft_Log_Page(tDevice *device);
 
     OPENSEA_OPERATIONS_API void show_effects_log_human(uint32_t effect);
 
@@ -83,7 +83,7 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_OPERATIONS_API int nvme_Print_DevSelfTest_Log_Page(tDevice *device);
+    OPENSEA_OPERATIONS_API eReturnValues nvme_Print_DevSelfTest_Log_Page(tDevice *device);
 
     //-----------------------------------------------------------------------------
     //
@@ -113,7 +113,7 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_OPERATIONS_API int nvme_Print_All_Feature_Identifiers(tDevice *device, eNvmeFeaturesSelectValue selectType, bool listOnlySupportedFeatures);
+    OPENSEA_OPERATIONS_API eReturnValues nvme_Print_All_Feature_Identifiers(tDevice *device, eNvmeFeaturesSelectValue selectType, bool listOnlySupportedFeatures);
 
 
     //-----------------------------------------------------------------------------
@@ -131,46 +131,23 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_OPERATIONS_API int nvme_Print_Feature_Details(tDevice *device, uint8_t featureID, eNvmeFeaturesSelectValue selectType);
+    OPENSEA_OPERATIONS_API eReturnValues nvme_Print_Feature_Details(tDevice *device, uint8_t featureID, eNvmeFeaturesSelectValue selectType);
 
     // \fn print_Nvme_Ctrl_Regs(tDevice * device)
     // \brief Prints the controller registers. 
     // \param[in] device struture
     // \return SUCCESS - pass, !SUCCESS fail or something went wrong
-    OPENSEA_OPERATIONS_API int print_Nvme_Ctrl_Regs(tDevice * device);
-
-    OPENSEA_OPERATIONS_API void print_smart_log(uint16_t  verNo, SmartVendorSpecific attr, int lastAttr);
-    OPENSEA_OPERATIONS_API uint64_t smart_attribute_vs(uint16_t  verNo, SmartVendorSpecific attr);
-    OPENSEA_OPERATIONS_API char* print_ext_smart_id(uint8_t  attrId);
-
-
-    //-----------------------------------------------------------------------------
-    //
-    //  nvme_Get_Ext_Smrt_Log_Page
-    //
-    //! \brief   Description:  Function to send Get Extended SMART Information Log Page NVMe command to a device
-    //
-    //  Entry:
-    //!   \param[in] device = pointer to tDevice structure
-    //!   \param[in] nsid = Namespace ID for the namespace of 0xFFFFFFFF for entire controller. 
-    //!   \param[out] pData = Data buffer (suppose to be 512 bytes)
-    //!   \param[in] dataLen = Data buffer Length
-    //!
-    //  Exit:
-    //!   \return SUCCESS = pass, !SUCCESS = something when wrong
-    //
-    //-----------------------------------------------------------------------------
-    OPENSEA_OPERATIONS_API int get_Ext_Smrt_Log(tDevice *device);
+    OPENSEA_OPERATIONS_API eReturnValues print_Nvme_Ctrl_Regs(tDevice * device);
 
     //-----------------------------------------------------------------------------
     //
     //  nvme_Get_Log_Size
     //
     //! \brief   Description:  Function to get the size for GetLog Page command by a utility. 
-    //!                        Currently it only supports the 3 mandatory logs, to expand later. 
-    //!                        Note: For Error log a single entry size is returned. 
+    //!                        NOTE: Some variable length logs will not return a size at this time. Vendor unique logs are not supported i nthis function
     //                         
     //  Entry:
+    //!   \param[in] device = pointer to the device structure. This is needed in order to calculate some log sizes that are not fixed
     //!   \param[in] logPageId = Log Page Identifier. 
     //!   \param[out] logSize = size of the Log to return 
     //!
@@ -178,11 +155,8 @@ extern "C"
     //!   \return SUCCESS = pass, !SUCCESS = something when wrong
     //
     //-----------------------------------------------------------------------------
-    OPENSEA_OPERATIONS_API int nvme_Get_Log_Size(uint8_t logPageId, uint64_t * logSize);
-
-    OPENSEA_OPERATIONS_API int clr_Pcie_Correctable_Errs(tDevice *device);
+    OPENSEA_OPERATIONS_API eReturnValues nvme_Get_Log_Size(tDevice* device, uint8_t logPageId, uint64_t * logSize);
 
 #if defined (__cplusplus)
 }
 #endif
-#endif //DISABLE_NVME_PASSTHROUGH

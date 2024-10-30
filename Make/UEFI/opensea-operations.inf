@@ -3,6 +3,7 @@
 #
 #
 ##
+# SPDX-License-Identifier: MPL-2.0
 
 [Defines]
   INF_VERSION                    = 0x00010005
@@ -44,6 +45,10 @@
   include/writesame.h
   include/zoned_operations.h
   include/reservations.h
+  include/partition_info.h
+  include/farm_log.h
+  include/ata_device_config_overlay.h
+  include/sata_phy.h
   src/ata_Security.c
   src/buffer_test.c
   src/defect.c
@@ -69,6 +74,10 @@
   src/writesame.c
   src/zoned_operations.c
   src/reservations.c
+  src/farm_log.c
+  src/partition_info.c
+  src/ata_device_config_overlay.c
+  src/sata_phy.c
 
 [Packages]
   StdLib/StdLib.dec

@@ -1,7 +1,8 @@
+// SPDX-License-Identifier: MPL-2.0
 //
 // Do NOT modify or remove this copyright and license
 //
-// Copyright (c) 2012-2021 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+// Copyright (c) 2012-2024 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
 //
 // This software is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -12,6 +13,19 @@
 // \file dst.c
 // \brief This file defines the function calls for dst and dst related operations
 
+#include "common_types.h"
+#include "precision_timer.h"
+#include "memory_safety.h"
+#include "type_conversion.h"
+#include "string_utils.h"
+#include "bit_manip.h"
+#include "code_attributes.h"
+#include "math_utils.h"
+#include "error_translation.h"
+#include "io_utils.h"
+#include "time_utils.h"
+#include "sleep.h"
+
 #include "operations_Common.h"
 #include "dst.h"
 #include "sector_repair.h"
@@ -21,36 +35,29 @@
 #include <stdlib.h>
 #include "platform_helper.h"
 
-int ata_Abort_DST(tDevice *device)
+eReturnValues ata_Abort_DST(tDevice *device)
 {
-    int result = UNKNOWN;
-    result = ata_SMART_Offline(device, 0x7F, 15);
-    return result;
+    return ata_SMART_Offline(device, 0x7F, 15);
 }
-int scsi_Abort_DST(tDevice *device)
+
+eReturnValues scsi_Abort_DST(tDevice *device)
 {
-    int     result = UNKNOWN;
-    result = scsi_Send_Diagnostic(device, 4, 0, 0, 0, 0, 0, NULL, 0, 15);
-    return result;
+    return scsi_Send_Diagnostic(device, 4, 0, 0, 0, 0, 0, M_NULLPTR, 0, 15);
 }
-#if !defined (DISABLE_NVME_PASSTHROUGH)
-int nvme_Abort_DST(tDevice *device, uint32_t nsid)
+
+eReturnValues nvme_Abort_DST(tDevice *device, uint32_t nsid)
 {
-    int result = UNKNOWN;
-    result = nvme_Device_Self_Test(device, nsid, 0x0F);
-    return result;
+    return nvme_Device_Self_Test(device, nsid, 0x0F);
 }
-#endif
-int abort_DST(tDevice *device)
+
+eReturnValues abort_DST(tDevice *device)
 {
-    int result = UNKNOWN;
+    eReturnValues result = UNKNOWN;
     switch (device->drive_info.drive_type)
     {
     case NVME_DRIVE:
-#if !defined (DISABLE_NVME_PASSTHROUGH)
-        result = nvme_Abort_DST(device, UINT32_MAX);//TODO: Need to handle whether we are testing all namespaces or a specific namespace ID!
+        result = nvme_Abort_DST(device, UINT32_MAX);
         break;
-#endif
     case SCSI_DRIVE:
         result = scsi_Abort_DST(device);
         break;
@@ -63,27 +70,28 @@ int abort_DST(tDevice *device)
     }
     return result;
 }
-int ata_Get_DST_Progress(tDevice *device, uint32_t *percentComplete, uint8_t *status)
+
+eReturnValues ata_Get_DST_Progress(tDevice *device, uint32_t *percentComplete, uint8_t *status)
 {
-    int     result = UNKNOWN;
-    uint8_t temp_buf[512] = { 0 };
+    eReturnValues result = UNKNOWN;
+    DECLARE_ZERO_INIT_ARRAY(uint8_t, temp_buf, 512);
     result = ata_SMART_Read_Data(device, temp_buf, sizeof(temp_buf));
     if (result == SUCCESS)
     {
         //get the progress
         *status = temp_buf[363];
-        //get the status before we shift it by 4 for the while condition check.
-        *percentComplete = (*status & 0x0F) * 0x0A;
-        *status = M_Nibble0((*status >> 4));
+        *percentComplete = M_Nibble0(*status) * 10;
+        *status = M_Nibble1(*status);
     }
     return result;
 }
-int scsi_Get_DST_Progress(tDevice *device, uint32_t *percentComplete, uint8_t *status)
+
+eReturnValues scsi_Get_DST_Progress(tDevice *device, uint32_t *percentComplete, uint8_t *status)
 {
     //04h 09h LOGICAL UNIT NOT READY, SELF-TEST IN PROGRESS
-    int     result = UNKNOWN;
-    uint8_t *temp_buf = C_CAST(uint8_t*, calloc_aligned(LEGACY_DRIVE_SEC_SIZE, sizeof(uint8_t), device->os_info.minimumAlignment));
-    if (temp_buf == NULL)
+    eReturnValues result = UNKNOWN;
+    uint8_t *temp_buf = C_CAST(uint8_t*, safe_calloc_aligned(LEGACY_DRIVE_SEC_SIZE, sizeof(uint8_t), device->os_info.minimumAlignment));
+    if (temp_buf == M_NULLPTR)
     {
         perror("Calloc Failure!\n");
         return MEMORY_FAILURE;
@@ -100,29 +108,29 @@ int scsi_Get_DST_Progress(tDevice *device, uint32_t *percentComplete, uint8_t *s
         *percentComplete *= 100;
         *percentComplete /= 65536;
     }
-    safe_Free_aligned(temp_buf)
+    safe_free_aligned(&temp_buf);
     return result;
 }
-#if !defined(DISABLE_NVME_PASSTHROUGH)
-int nvme_Get_DST_Progress(tDevice *device, uint32_t *percentComplete, uint8_t *status)
+
+eReturnValues nvme_Get_DST_Progress(tDevice *device, uint32_t *percentComplete, uint8_t *status)
 {
-    int result = UNKNOWN;
-    uint8_t nvmeSelfTestLog[564] = { 0 };//strange size for the log, but it's what I see in the spec - TJE
+    eReturnValues result = UNKNOWN;
+    DECLARE_ZERO_INIT_ARRAY(uint8_t, nvmeSelfTestLogBuf, 564);//strange size for the log, but it's what I see in the spec - TJE
     nvmeGetLogPageCmdOpts getDSTLog;
     memset(&getDSTLog, 0, sizeof(nvmeGetLogPageCmdOpts));
-    getDSTLog.addr = nvmeSelfTestLog;
+    getDSTLog.addr = nvmeSelfTestLogBuf;
     getDSTLog.dataLen = 564;
     getDSTLog.lid = 0x06;
     if (SUCCESS == nvme_Get_Log_Page(device, &getDSTLog))
     {
         result = SUCCESS;
-        if (nvmeSelfTestLog[0] == 0)
+        if (nvmeSelfTestLogBuf[0] == 0)
         {
             //no self test in progress
             *percentComplete = 0;
             //need to set a status value based on the most recent result data
             uint32_t newestResultOffset = 4;
-            *status = M_Nibble0(nvmeSelfTestLog[newestResultOffset + 0]);//This should be fine for the rest of the running DST code.
+            *status = M_Nibble0(nvmeSelfTestLogBuf[newestResultOffset + 0]);//This should be fine for the rest of the running DST code.
             //According to spec, if status bit is 0x0F, that means entry is not valid(doesn't cantain valid test results.
             //and in that case, we have to ignore this bit, and consider this as completed/success.
             //I have seen this issue on the drive, where DST was never run. - Nidhi
@@ -134,7 +142,7 @@ int nvme_Get_DST_Progress(tDevice *device, uint32_t *percentComplete, uint8_t *s
         else
         {
             //NVMe made this simple...if this is 25, then it's 25% complete. no silly business
-            *percentComplete = nvmeSelfTestLog[1];
+            *percentComplete = nvmeSelfTestLogBuf[1];
             //Setting the status to Fh to work with existing SCSI/ATA code in the run_DST_Function - TJE
             *status = 0x0F;
         }
@@ -145,10 +153,10 @@ int nvme_Get_DST_Progress(tDevice *device, uint32_t *percentComplete, uint8_t *s
     }
     return result;
 }
-#endif
-int get_DST_Progress(tDevice *device, uint32_t *percentComplete, uint8_t *status)
+
+eReturnValues get_DST_Progress(tDevice *device, uint32_t *percentComplete, uint8_t *status)
 {
-    int      result = UNKNOWN;
+    eReturnValues result = UNKNOWN;
     *percentComplete = 0;
     *status = 0xFF;
     switch (device->drive_info.drive_type)
@@ -158,10 +166,8 @@ int get_DST_Progress(tDevice *device, uint32_t *percentComplete, uint8_t *status
         *percentComplete = 100 - *percentComplete; //make this match SCSI
         break;
     case NVME_DRIVE:
-#if !defined (DISABLE_NVME_PASSTHROUGH)
         result = nvme_Get_DST_Progress(device, percentComplete, status);
         break;
-#endif
     case SCSI_DRIVE:
         result = scsi_Get_DST_Progress(device, percentComplete, status);
         break;
@@ -175,7 +181,6 @@ int get_DST_Progress(tDevice *device, uint32_t *percentComplete, uint8_t *status
     return result;
 }
 
-//TODO: Status codes in NVMe are slightly different! Need a bool to pass in to say when it's from NVMe)
 void translate_DST_Status_To_String(uint8_t status, char *translatedString, bool justRanDST, bool isNVMeDrive)
 {
     if (!translatedString)
@@ -312,9 +317,9 @@ void translate_DST_Status_To_String(uint8_t status, char *translatedString, bool
     }
 }
 
-int print_DST_Progress(tDevice *device)
+eReturnValues print_DST_Progress(tDevice *device)
 {
-    int result = UNKNOWN;
+    eReturnValues result = UNKNOWN;
     uint32_t percentComplete = 0;
     uint8_t status = 0xFF;
     result = get_DST_Progress(device, &percentComplete, &status);
@@ -332,14 +337,12 @@ int print_DST_Progress(tDevice *device)
     else
     {
         bool isNVMeDrive = false;
-        char statusTranslation[MAX_DST_STATUS_STRING_LENGTH] = { 0 };
-#if !defined(DISABLE_NVME_PASSTHROUGH)
+        DECLARE_ZERO_INIT_ARRAY(char, statusTranslation, MAX_DST_STATUS_STRING_LENGTH);
         if (device->drive_info.drive_type == NVME_DRIVE)
         {
             isNVMeDrive = true;
         }
-#endif
-        printf("\tTest Progress = %"PRIu32"%%\n", percentComplete);
+        printf("\tTest Progress = %" PRIu32 "%%\n", percentComplete);
         translate_DST_Status_To_String(status, statusTranslation, false, isNVMeDrive);
         printf("%s\n", statusTranslation);
         switch (status)
@@ -394,7 +397,6 @@ bool is_Self_Test_Supported(tDevice *device)
     switch (device->drive_info.drive_type)
     {
     case NVME_DRIVE:
-#if !defined (DISABLE_NVME_PASSTHROUGH)
         //set based on controller reported capabilities first
         if (device->drive_info.IdentifyData.nvme.ctrl.oacs & BIT4)
         {
@@ -406,24 +408,42 @@ bool is_Self_Test_Supported(tDevice *device)
             supported = false;
         }
         break;
-#endif
     case SCSI_DRIVE:
     {
-        uint8_t selfTestResultsLog[LP_SELF_TEST_RESULTS_LEN] = { 0 };
+        DECLARE_ZERO_INIT_ARRAY(uint8_t, selfTestResultsLog, LP_SELF_TEST_RESULTS_LEN);
         if (SUCCESS == scsi_Log_Sense_Cmd(device, false, LPC_CUMULATIVE_VALUES, LP_SELF_TEST_RESULTS, 0, 0, selfTestResultsLog, LP_SELF_TEST_RESULTS_LEN))
         {
             supported = true;
         }
     }
-        break;
+    break;
     case ATA_DRIVE:
         if (is_SMART_Enabled(device))
         {
             //also check that self test is supported by the drive
-            if((device->drive_info.IdentifyData.ata.Word084 > 0 && device->drive_info.IdentifyData.ata.Word084 != UINT16_MAX && device->drive_info.IdentifyData.ata.Word084 & BIT1)
-                || (device->drive_info.IdentifyData.ata.Word087 > 0 && device->drive_info.IdentifyData.ata.Word087 != UINT16_MAX && device->drive_info.IdentifyData.ata.Word087 & BIT1))
+            if ((is_ATA_Identify_Word_Valid(device->drive_info.IdentifyData.ata.Word084) && device->drive_info.IdentifyData.ata.Word084 & BIT1)
+                || (is_ATA_Identify_Word_Valid(device->drive_info.IdentifyData.ata.Word087) && device->drive_info.IdentifyData.ata.Word087 & BIT1))
             {
-                supported = true;
+                //NOTE: Also need to check the SMART read data as it also contains a bit to indicate if DST is supported or not!
+                //      That field also indicates whether Short, extended, or conveyance tests are supported!
+                //      Since the SAMART read data has been made obsolete on newer standards, we may need a version check or something to keep proper behavior
+                //      as new devices show up without support for this information.
+                //SMART read data is listed as optional in ata/atapi-7
+                DECLARE_ZERO_INIT_ARRAY(uint8_t, smartData, 512);
+                if (SUCCESS == ata_SMART_Read_Data(device, smartData, 512))
+                {
+                    //check the pff-line data collection capability field
+                    //assume this is more accurate since this seems to be the case with some older products
+                    if ((smartData[367] & BIT0) && (smartData[367] & BIT4))//bit0 = the subcommand, bit4 = self-test routine implemented (short and extended)
+                    {
+                        supported = true;
+                    }
+                }
+                else
+                {
+                    //assume that the identify bits were accurate for this command.
+                    supported = true;
+                }
             }
         }
         break;
@@ -438,10 +458,10 @@ bool is_Conveyence_Self_Test_Supported(tDevice *device)
     bool supported = false;
     if (device->drive_info.drive_type == ATA_DRIVE)
     {
-        uint8_t smartReadData[LEGACY_DRIVE_SEC_SIZE] = { 0 };
+        DECLARE_ZERO_INIT_ARRAY(uint8_t, smartReadData, LEGACY_DRIVE_SEC_SIZE);
         if (SUCCESS == ata_SMART_Read_Data(device, smartReadData, LEGACY_DRIVE_SEC_SIZE))
         {
-            if (smartReadData[367] & BIT5)
+            if ((smartReadData[367] & BIT0) && (smartReadData[367] & BIT5))
             {
                 supported = true;
             }
@@ -450,9 +470,26 @@ bool is_Conveyence_Self_Test_Supported(tDevice *device)
     return supported;
 }
 
-int send_DST(tDevice *device, eDSTType DSTType, bool captiveForeground, uint32_t commandTimeout)
+bool is_Selective_Self_Test_Supported(tDevice* device)
 {
-    int ret = NOT_SUPPORTED;
+    bool supported = false;
+    if (device->drive_info.drive_type == ATA_DRIVE)
+    {
+        DECLARE_ZERO_INIT_ARRAY(uint8_t, smartReadData, LEGACY_DRIVE_SEC_SIZE);
+        if (SUCCESS == ata_SMART_Read_Data(device, smartReadData, LEGACY_DRIVE_SEC_SIZE))
+        {
+            if ((smartReadData[367] & BIT0) && (smartReadData[367] & BIT6))
+            {
+                supported = true;
+            }
+        }
+    }
+    return supported;
+}
+
+eReturnValues send_DST(tDevice *device, eDSTType DSTType, bool captiveForeground, uint32_t commandTimeout)
+{
+    eReturnValues ret = NOT_SUPPORTED;
     if (commandTimeout == 0)
     {
         if (os_Is_Infinite_Timeout_Supported())
@@ -468,8 +505,6 @@ int send_DST(tDevice *device, eDSTType DSTType, bool captiveForeground, uint32_t
     switch (device->drive_info.drive_type)
     {
     case NVME_DRIVE:
-#if !defined (DISABLE_NVME_PASSTHROUGH)
-        //TODO: Handle individual namespaces! currently just running it on all of them!
         switch (DSTType)
         {
         case DST_TYPE_SHORT:
@@ -483,28 +518,27 @@ int send_DST(tDevice *device, eDSTType DSTType, bool captiveForeground, uint32_t
             break;
         }
         break;
-#endif
     case SCSI_DRIVE:
         switch (DSTType)
         {
         case DST_TYPE_SHORT:
             if (captiveForeground)
             {
-                ret = scsi_Send_Diagnostic(device, 0x05, 0, 0, 0, 0, 0, NULL, 0, commandTimeout);
+                ret = scsi_Send_Diagnostic(device, 0x05, 0, 0, 0, 0, 0, M_NULLPTR, 0, commandTimeout);
             }
             else
             {
-                ret = scsi_Send_Diagnostic(device, 0x01, 0, 0, 0, 0, 0, NULL, 0, commandTimeout);
+                ret = scsi_Send_Diagnostic(device, 0x01, 0, 0, 0, 0, 0, M_NULLPTR, 0, commandTimeout);
             }
             break;
         case DST_TYPE_LONG:
             if (captiveForeground)
             {
-                ret = scsi_Send_Diagnostic(device, 0x06, 0, 0, 0, 0, 0, NULL, 0, commandTimeout);
+                ret = scsi_Send_Diagnostic(device, 0x06, 0, 0, 0, 0, 0, M_NULLPTR, 0, commandTimeout);
             }
             else
             {
-                ret = scsi_Send_Diagnostic(device, 0x02, 0, 0, 0, 0, 0, NULL, 0, commandTimeout);
+                ret = scsi_Send_Diagnostic(device, 0x02, 0, 0, 0, 0, 0, M_NULLPTR, 0, commandTimeout);
             }
             break;
         case DST_TYPE_CONVEYENCE://not available on SCSI
@@ -564,9 +598,217 @@ int send_DST(tDevice *device, eDSTType DSTType, bool captiveForeground, uint32_t
     return ret;
 }
 
-int run_DST(tDevice *device, eDSTType DSTType, bool pollForProgress, bool captiveForeground, bool ignoreMaxTime)
+static bool is_ATA_SMART_Offline_Supported(tDevice* device, bool* abortRestart, uint16_t* offlineTimeSeconds)
 {
-    int ret = NOT_SUPPORTED;
+    bool supported = false;
+    if (is_SMART_Enabled(device))
+    {
+        //also check that self test is supported by the drive
+        if ((is_ATA_Identify_Word_Valid(device->drive_info.IdentifyData.ata.Word084) && device->drive_info.IdentifyData.ata.Word084 & BIT1)
+            || (is_ATA_Identify_Word_Valid(device->drive_info.IdentifyData.ata.Word087) && device->drive_info.IdentifyData.ata.Word087 & BIT1))
+        {
+            //NOTE: Also need to check the SMART read data as it also contains a bit to indicate if DST is supported or not!
+            //      That field also indicates whether Short, extended, or conveyance tests are supported!
+            //      Since the SAMART read data has been made obsolete on newer standards, we may need a version check or something to keep proper behavior
+            //      as new devices show up without support for this information.
+            //SMART read data is listed as optional in ata/atapi-7
+            DECLARE_ZERO_INIT_ARRAY(uint8_t, smartData, 512);
+            if (SUCCESS == ata_SMART_Read_Data(device, smartData, 512))
+            {
+                //check the pff-line data collection capability field
+                //assume this is more accurate since this seems to be the case with some older products
+                if (smartData[367] & BIT0)//bit0 = the subcommand
+                {
+                    supported = true;
+                    if (abortRestart)
+                    {
+                        if (smartData[367] & BIT2)
+                        {
+                            *abortRestart = true;
+                        }
+                        else
+                        {
+                            *abortRestart = false;
+                        }
+                    }
+                    if (offlineTimeSeconds)
+                    {
+                        *offlineTimeSeconds = M_BytesTo2ByteValue(smartData[365], smartData[364]);
+                    }
+                }
+            }
+            else
+            {
+                //assume that the identify bits were accurate for this command.
+                supported = true;
+            }
+        }
+    }
+    return supported;
+}
+
+static eReturnValues get_SMART_Offline_Status(tDevice* device, uint8_t *status)
+{
+    eReturnValues ret = SUCCESS;
+    if (!status)
+    {
+        return BAD_PARAMETER;
+    }
+    DECLARE_ZERO_INIT_ARRAY(uint8_t, smartData, 512);
+    ret = ata_SMART_Read_Data(device, smartData, 512);
+    if (ret == SUCCESS)
+    {
+        *status = smartData[362];
+    }
+    return ret;
+}
+
+//NOTE: During my testing, even a drive that doesn't "abort" due to a command interruption never continues when trying to poll.
+//      But the "in progress" wasn't added until ATA/ATAPI-7, so the polling may need to be restricted to drives with that
+//      standard compliance. The drive I have been testing is older and does not support that and does not seem to ever
+//      restart on its own. The standards just say it restarts after a "vendor specific event".
+//      Because of this, the polling code is removed entirely unless the following #define is set to reenable it. -TJE
+//#define ENABLE_SMART_OFFLINE_ROUTINE_POLLING 1
+eReturnValues run_SMART_Offline(tDevice* device)
+{
+    eReturnValues ret = NOT_SUPPORTED;
+    if (device->drive_info.drive_type == ATA_DRIVE)
+    {
+        bool abortRestart = false;
+        uint16_t offlineTimeInSeconds = 0;
+        if (is_ATA_SMART_Offline_Supported(device, &abortRestart, &offlineTimeInSeconds))
+        {
+            uint8_t hours = 0;
+            uint8_t minutes = 0;
+            uint8_t seconds = 0;
+            convert_Seconds_To_Displayable_Time(offlineTimeInSeconds, M_NULLPTR, M_NULLPTR, &hours, &minutes, &seconds);
+            printf("Data Collection time: %2" PRIu8 " hours, %2" PRIu8 " minutes, %2" PRIu8 " seconds\n", hours, minutes, seconds);
+            if (abortRestart)
+            {
+                printf("\tInterrupting commands will cause data collection to abort and will require manually restarting.\n");
+            }
+            else
+            {
+                printf("\tInterrupting commands will cause data collection to suspend and will restart after a vendor specific event.\n");
+            }
+            time_t currentTime = time(M_NULLPTR);
+            time_t futureTime = get_Future_Date_And_Time(currentTime, offlineTimeInSeconds);
+            DECLARE_ZERO_INIT_ARRAY(char, timeFormat, TIME_STRING_LENGTH);
+            printf("\tEstimated completion Time : sometime after %s\n", get_Current_Time_String(C_CAST(const time_t*, &futureTime), timeFormat, TIME_STRING_LENGTH));
+            ret = ata_SMART_Offline(device, 0, 15);
+            if (ret == SUCCESS)
+            {
+                uint8_t status = 0;
+                //count down for the abount of time the drive reports for how long this should take
+                uint16_t countDownSecondsRemaining = offlineTimeInSeconds;
+#if defined ENABLE_SMART_OFFLINE_ROUTINE_POLLING
+                bool inProgress = true;
+                uint16_t pollingTime = offlineTimeInSeconds / 10;//attempting to check enough times that it's in 10% increments, even though the device will not tell us a real percent complete here.
+                uint16_t pollCounter = 0;
+#endif //ENABLE_SMART_OFFLINE_ROUTINE_POLLING
+                while (countDownSecondsRemaining > 0
+#if defined ENABLE_SMART_OFFLINE_ROUTINE_POLLING
+                    && inProgress
+#endif //ENABLE_SMART_OFFLINE_ROUTINE_POLLING
+                    )
+                {
+                    convert_Seconds_To_Displayable_Time(countDownSecondsRemaining, M_NULLPTR, M_NULLPTR, &hours, &minutes, &seconds);
+                    printf("\r%2" PRIu8 " hours, %2" PRIu8 " minutes, %2" PRIu8 " seconds remaining", hours, minutes, seconds);
+                    fflush(stdout);
+                    delay_Seconds(1);
+                    --countDownSecondsRemaining;
+#if defined ENABLE_SMART_OFFLINE_ROUTINE_POLLING
+                    ++pollCounter;
+                    if (!abortRestart && pollCounter == pollingTime)
+                    {
+                        //time to to a progress check to determine if we should keep waiting or exit early.
+                        if (SUCCESS == get_SMART_Offline_Status(device, &status))
+                        {
+                            switch (status)
+                            {
+                            case 0:
+                            case 0x80:
+                            case 2:
+                            case 0x82:
+                            case 5:
+                            case 0x85:
+                            case 6:
+                            case 0x86:
+                                inProgress = false;
+                                break;
+                            case 4:
+                            case 0x84:
+                                //command "suspended" can be returned just by making the query to get progress.
+                                //So treat this case as "in progress" as well and do not stop.
+                                //SEE NOTE above. This does not seem to work like expected as this never seems to restart -TJE
+                                inProgress = false;
+                                break;
+                            case 3:
+                                //still in progress. No need to stop.
+                                break;
+                            default:
+                                //reserved or vendor unique status....leave as "in progress" until we get one of the completion codes.
+                                //Leaving this as "in progress" until the time runs out because some early drives may have used a vendor unique
+                                //code to indicate "in progress" versus some other error since the case "3" above was not defined until later.-TJE
+                                break;
+                            }
+                        }
+                        //else just let it keep running for the time the drive reported earlier.
+                        pollCounter = 0;
+                    }
+#endif //ENABLE_SMART_OFFLINE_ROUTINE_POLLING
+                }
+                //print this to finish the countdown to zero.-TJE
+                printf("\r 0 hours,  0 minutes,  0 seconds remaining\n");
+                if (SUCCESS == get_SMART_Offline_Status(device, &status))
+                {
+                    printf("\nSMART Off-line data collection ");
+                    switch (status)
+                    {
+                    case 0:
+                    case 0x80:
+                        printf("never started\n");
+                        break;
+                    case 2:
+                    case 0x82:
+                        printf("completed without error\n");
+                        break;
+                    case 4:
+                    case 0x84:
+                        printf("was suspended by an interrupting command from the host\n");
+                        break;
+                    case 5:
+                    case 0x85:
+                        printf("was aborted by an interrupting command from the host\n");
+                        break;
+                    case 6:
+                    case 0x86:
+                        printf("was aborted by the device with a fatal error\n");
+                        break;
+                    case 3:
+                        printf("is progress\n");
+                        break;
+                    default:
+                        if (status >= 0xC0 /*through 0xff*/ || (status >= 0x40 && status <= 0x7F))
+                        {
+                            printf("status is vendor specific\n");
+                        }
+                        else
+                        {
+                            printf("status is reserved\n");
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return ret;
+}
+
+eReturnValues run_DST(tDevice *device, eDSTType DSTType, bool pollForProgress, bool captiveForeground, bool ignoreMaxTime)
+{
+    eReturnValues ret = NOT_SUPPORTED;
     if (is_Self_Test_Supported(device))
     {
         uint8_t status = 0xF0;
@@ -577,7 +819,7 @@ int run_DST(tDevice *device, eDSTType DSTType, bool pollForProgress, bool captiv
         uint32_t maxTimeIncreases = 2;
         uint32_t timeIncreaseWarningCount = 1;
         uint32_t totalDSTTimeSeconds = 120;
-        uint32_t maxDSTWaitTimeSeconds = totalDSTTimeSeconds * 5;//TODO: add some kind of multiplier or something to this
+        uint32_t maxDSTWaitTimeSeconds = totalDSTTimeSeconds * 5;
         //check if DST is already running
         ret = get_DST_Progress(device, &percentComplete, &status);
         if (status == 0x0F)
@@ -605,15 +847,16 @@ int run_DST(tDevice *device, eDSTType DSTType, bool pollForProgress, bool captiv
                 maxTimeIncreases *= 3;
                 timeIncreaseWarningCount *= 3;
                 {
-                    uint8_t hours = 0, minutes = 0;
+                    uint8_t hours = 0;
+                    uint8_t minutes = 0;
                     if (SUCCESS == get_Long_DST_Time(device, &hours, &minutes))
                     {
                         if (captiveForeground)
                         {
-                            commandTimeout = hours * 3600 + minutes * 60;//this is a value in seconds
+                            commandTimeout = C_CAST(uint32_t, hours) * UINT32_C(3600) + C_CAST(uint32_t, minutes) * UINT32_C(60);//this is a value in seconds
                         }
-                        totalDSTTimeSeconds = hours * 3600 + minutes * 60;
-                        maxDSTWaitTimeSeconds = totalDSTTimeSeconds * 5;//TODO: add some kind of multiplier or something to this
+                        totalDSTTimeSeconds = hours * UINT32_C(3600) + minutes * UINT32_C(60);
+                        maxDSTWaitTimeSeconds = totalDSTTimeSeconds * UINT32_C(5);
                     }
                     else
                     {
@@ -623,7 +866,7 @@ int run_DST(tDevice *device, eDSTType DSTType, bool pollForProgress, bool captiv
                             commandTimeout = UINT32_MAX;
                         }
                         totalDSTTimeSeconds = 14400;//a fallback for drives not reporting a time, so using 4 hours for now. This likely will not ever happen
-                        maxDSTWaitTimeSeconds = totalDSTTimeSeconds * 5;//TODO: add some kind of multiplier or something to this
+                        maxDSTWaitTimeSeconds = totalDSTTimeSeconds * 5;
                     }
                 }
                 break;
@@ -648,11 +891,11 @@ int run_DST(tDevice *device, eDSTType DSTType, bool pollForProgress, bool captiv
                 delay_Seconds(1);//delay for a second before starting to poll for progress to give it time to start
                 //set status to 0x08 before the loop or it will not get entered
                 status = 0x0F;
-                time_t dstProgressTimer = time(NULL);
-                time_t startTime = time(NULL);
+                time_t dstProgressTimer = time(M_NULLPTR);
+                time_t startTime = time(M_NULLPTR);
                 uint32_t lastProgressIndication = 0;
                 uint8_t timeExtensionCount = 0;
-                char *overTimeWarningMessage = "WARNING: DST is taking longer than expected.";
+                const char *overTimeWarningMessage = "WARNING: DST is taking longer than expected.";
                 bool showTimeWarning = false;
                 bool abortForTooLong = false;
                 while (status == 0x0F && (ret == SUCCESS || ret == IN_PROGRESS))
@@ -679,7 +922,7 @@ int run_DST(tDevice *device, eDSTType DSTType, bool pollForProgress, bool captiv
                         break;
                     }
                     //make the time between progress polls bigger if it isn't changing quickly to allow the drive time to finish any recovery it's doing.
-                    if (difftime(time(NULL), dstProgressTimer) > timeDiff && lastProgressIndication == percentComplete)
+                    if (difftime(time(M_NULLPTR), dstProgressTimer) > timeDiff && lastProgressIndication == percentComplete)
                     {
                         //We are likely pinging the drive too quickly during the read test and error recovery isn't finishing...extend the delay time
                         if (timeExtensionCount <= maxTimeIncreases)
@@ -688,7 +931,7 @@ int run_DST(tDevice *device, eDSTType DSTType, bool pollForProgress, bool captiv
                             timeDiff *= 2;
                             ++timeExtensionCount;
                         }
-                        dstProgressTimer = time(NULL);//reset this beginning timer since we changed the polling time
+                        dstProgressTimer = time(M_NULLPTR);//reset this beginning timer since we changed the polling time
                         if (!ignoreMaxTime && timeExtensionCount > maxTimeIncreases && difftime(dstProgressTimer, startTime) > maxDSTWaitTimeSeconds)
                         {
                             //only abort if we are past the total DST time and have already increased the delays multiple times.
@@ -698,7 +941,7 @@ int run_DST(tDevice *device, eDSTType DSTType, bool pollForProgress, bool captiv
                             abortForTooLong = true;
                             break;
                         }
-                        else if(timeExtensionCount > timeIncreaseWarningCount && difftime(dstProgressTimer, startTime) > totalDSTTimeSeconds)
+                        else if (timeExtensionCount > timeIncreaseWarningCount && difftime(dstProgressTimer, startTime) > totalDSTTimeSeconds)
                         {
                             showTimeWarning = true;
                         }
@@ -708,7 +951,7 @@ int run_DST(tDevice *device, eDSTType DSTType, bool pollForProgress, bool captiv
                 if (status == 0 && ret == SUCCESS)
                 {
                     //printf 35 characters + width of warning message to clear the line before printing this final status update
-                    printf("\r                                    %.*s", C_CAST(int, strlen(overTimeWarningMessage)), "                                                                        ");
+                    printf("\r                                    %.*s", C_CAST(int, safe_strlen(overTimeWarningMessage)), "                                                                        ");
                     printf("\r    Test progress: 100%% complete   ");
                     fflush(stdout);
                     ret = SUCCESS; //we passed.
@@ -733,13 +976,11 @@ int run_DST(tDevice *device, eDSTType DSTType, bool pollForProgress, bool captiv
                     else
                     {
                         bool isNVMeDrive = false;
-                        char statusTranslation[MAX_DST_STATUS_STRING_LENGTH] = { 0 };
-#if !defined (DISABLE_NVME_PASSTHROUGH)
+                        DECLARE_ZERO_INIT_ARRAY(char, statusTranslation, MAX_DST_STATUS_STRING_LENGTH);
                         if (device->drive_info.drive_type == NVME_DRIVE)
                         {
                             isNVMeDrive = true;
                         }
-#endif
                         translate_DST_Status_To_String(status, statusTranslation, true, isNVMeDrive);
                         printf("\n%s\n", statusTranslation);
                     }
@@ -770,59 +1011,55 @@ int run_DST(tDevice *device, eDSTType DSTType, bool pollForProgress, bool captiv
 #endif
                     //if the LBA registers have C2-4F or 2C-F4, then we have pass vs fail results.
                     if (device->drive_info.drive_type == ATA_DRIVE && device->drive_info.lastCommandRTFRs.lbaMid == ATA_SMART_SIG_MID && device->drive_info.lastCommandRTFRs.lbaHi == ATA_SMART_SIG_HI)
-            		{
-                		ret = SUCCESS;
-            		}
-            		else if (device->drive_info.drive_type == ATA_DRIVE && device->drive_info.lastCommandRTFRs.lbaMid == ATA_SMART_BAD_SIG_MID && device->drive_info.lastCommandRTFRs.lbaHi == ATA_SMART_BAD_SIG_HI)
-            		{
-                		//SMART is tripped
-                		ret = FAILURE;
-            		}
-            		else //SCSI drive, or ATA rtfrs not available
-            		{
-                    	//otherwise, read the DST log to figure out the results
-                    	dstLogEntries logEntries;
-                    	memset(&logEntries, 0, sizeof(dstLogEntries));
-                    	//read the DST log for the result to avoid any SATL issues...
-                    	if (SUCCESS == get_DST_Log_Entries(device, &logEntries))
-                    	{
-                        	if (0 == M_Nibble1(logEntries.dstEntry[0].selfTestExecutionStatus))
-                        	{
-                            	ret = SUCCESS;
-                        	}
-                        	else if (0xF == M_Nibble1(logEntries.dstEntry[0].selfTestExecutionStatus))
-                        	{
-                            	//NOTE: this shouldn't ever happen, but I've seen weird things before...-TJE
-                            	ret = IN_PROGRESS;
-                        	}
+                    {
+                        ret = SUCCESS;
+                    }
+                    else if (device->drive_info.drive_type == ATA_DRIVE && device->drive_info.lastCommandRTFRs.lbaMid == ATA_SMART_BAD_SIG_MID && device->drive_info.lastCommandRTFRs.lbaHi == ATA_SMART_BAD_SIG_HI)
+                    {
+                        //SMART is tripped
+                        ret = FAILURE;
+                    }
+                    else //SCSI drive, or ATA rtfrs not available
+                    {
+                        //otherwise, read the DST log to figure out the results
+                        dstLogEntries logEntries;
+                        memset(&logEntries, 0, sizeof(dstLogEntries));
+                        //read the DST log for the result to avoid any SATL issues...
+                        if (SUCCESS == get_DST_Log_Entries(device, &logEntries))
+                        {
+                            if (0 == M_Nibble1(logEntries.dstEntry[0].selfTestExecutionStatus))
+                            {
+                                ret = SUCCESS;
+                            }
+                            else if (0xF == M_Nibble1(logEntries.dstEntry[0].selfTestExecutionStatus))
+                            {
+                                //NOTE: this shouldn't ever happen, but I've seen weird things before...-TJE
+                                ret = IN_PROGRESS;
+                            }
                             else if (0x1 == M_Nibble1(logEntries.dstEntry[0].selfTestExecutionStatus) || 0x2 == M_Nibble1(logEntries.dstEntry[0].selfTestExecutionStatus))
                             {
                                 //DST was aborted by the host somehow.
                                 ret = ABORTED;
                             }
-                        	else
-                        	{
-                            	ret = FAILURE;
-                        	}
-                    	}
-                    	else
-                    	{
-                        	ret = UNKNOWN;
-                    	}
+                            else
+                            {
+                                ret = FAILURE;
+                            }
+                        }
+                        else
+                        {
+                            ret = UNKNOWN;
+                        }
                     }
-#if !defined (DISABLE_NVME_PASSTHORUGH)
                 }
-#endif
                 if (VERBOSITY_QUIET < device->deviceVerbosity)
                 {
                     bool isNVMeDrive = false;
-                    char statusTranslation[MAX_DST_STATUS_STRING_LENGTH] = { 0 };
-#if !defined (DISABLE_NVME_PASSTHROUGH)
+                    DECLARE_ZERO_INIT_ARRAY(char, statusTranslation, MAX_DST_STATUS_STRING_LENGTH);
                     if (device->drive_info.drive_type == NVME_DRIVE)
                     {
                         isNVMeDrive = true;
                     }
-#endif
                     translate_DST_Status_To_String(status, statusTranslation, true, isNVMeDrive);
                     printf("\n%s\n", statusTranslation);
                 }
@@ -841,10 +1078,10 @@ int run_DST(tDevice *device, eDSTType DSTType, bool pollForProgress, bool captiv
     return ret;
 }
 
-int get_Long_DST_Time(tDevice *device, uint8_t *hours, uint8_t *minutes)
+eReturnValues get_Long_DST_Time(tDevice *device, uint8_t *hours, uint8_t *minutes)
 {
-    int ret = UNKNOWN;
-    if (hours == NULL || minutes == NULL)
+    eReturnValues ret = UNKNOWN;
+    if (hours == M_NULLPTR || minutes == M_NULLPTR)
     {
         return BAD_PARAMETER;
     }
@@ -854,8 +1091,8 @@ int get_Long_DST_Time(tDevice *device, uint8_t *hours, uint8_t *minutes)
         if (is_Self_Test_Supported(device))
         {
             uint16_t longDSTTime = 0;
-            uint8_t *smartData = C_CAST(uint8_t*, calloc_aligned(LEGACY_DRIVE_SEC_SIZE, sizeof(uint8_t), device->os_info.minimumAlignment));
-            if (smartData == NULL)
+            uint8_t *smartData = C_CAST(uint8_t*, safe_calloc_aligned(LEGACY_DRIVE_SEC_SIZE, sizeof(uint8_t), device->os_info.minimumAlignment));
+            if (smartData == M_NULLPTR)
             {
                 perror("calloc failure\n");
                 return MEMORY_FAILURE;
@@ -872,25 +1109,23 @@ int get_Long_DST_Time(tDevice *device, uint8_t *hours, uint8_t *minutes)
                 *minutes = C_CAST(uint8_t, longDSTTime % 60);
                 ret = SUCCESS;
             }
-            safe_Free_aligned(smartData)
+            safe_free_aligned(&smartData);
         }
         break;
     case NVME_DRIVE:
-#if !defined (DISABLE_NVME_PASSTHROUGH)
     {
         uint16_t longTestTime = device->drive_info.IdentifyData.nvme.ctrl.edstt;
         *hours = C_CAST(uint8_t, longTestTime / 60);
         *minutes = C_CAST(uint8_t, longTestTime % 60);
         ret = SUCCESS;
     }
-        break;
-#endif
+    break;
     case SCSI_DRIVE:
     {
         uint16_t longDSTTime = 0;
         bool getTimeFromExtendedInquiryData = false;
-        uint8_t *controlMP = C_CAST(uint8_t*, calloc_aligned(MP_CONTROL_LEN + MODE_PARAMETER_HEADER_10_LEN, sizeof(uint8_t), device->os_info.minimumAlignment));
-        if (controlMP == NULL)
+        uint8_t *controlMP = C_CAST(uint8_t*, safe_calloc_aligned(MP_CONTROL_LEN + MODE_PARAMETER_HEADER_10_LEN, sizeof(uint8_t), device->os_info.minimumAlignment));
+        if (controlMP == M_NULLPTR)
         {
             perror("calloc failure!");
             return MEMORY_FAILURE;
@@ -934,11 +1169,11 @@ int get_Long_DST_Time(tDevice *device, uint8_t *hours, uint8_t *minutes)
                 getTimeFromExtendedInquiryData = true;//some crappy USB bridges may not support the mode page, but will support the VPD page, so attempt to read the VPD page anyways
             }
         }
-        safe_Free_aligned(controlMP)
+        safe_free_aligned(&controlMP);
         if (getTimeFromExtendedInquiryData)
         {
-            uint8_t *extendedInqyData = C_CAST(uint8_t*, calloc_aligned(VPD_EXTENDED_INQUIRY_LEN, sizeof(uint8_t), device->os_info.minimumAlignment));
-            if (extendedInqyData == NULL)
+            uint8_t *extendedInqyData = C_CAST(uint8_t*, safe_calloc_aligned(VPD_EXTENDED_INQUIRY_LEN, sizeof(uint8_t), device->os_info.minimumAlignment));
+            if (extendedInqyData == M_NULLPTR)
             {
                 perror("calloc failure!\n");
                 return MEMORY_FAILURE;
@@ -952,7 +1187,7 @@ int get_Long_DST_Time(tDevice *device, uint8_t *hours, uint8_t *minutes)
                 *minutes = C_CAST(uint8_t, longDSTTime % 60);
                 ret = SUCCESS;
             }
-            safe_Free_aligned(extendedInqyData)
+            safe_free_aligned(&extendedInqyData);
         }
     }
     break;
@@ -963,181 +1198,30 @@ int get_Long_DST_Time(tDevice *device, uint8_t *hours, uint8_t *minutes)
     return ret;
 }
 
-bool get_Error_LBA_From_ATA_DST_Log(tDevice *device, uint64_t *lba)
-{
-    bool isValidLBA = false;
-    uint32_t logSize = 0;
-    uint8_t *selfTestResults = C_CAST(uint8_t*, calloc_aligned(LEGACY_DRIVE_SEC_SIZE, sizeof(uint8_t), device->os_info.minimumAlignment));
-    if (!selfTestResults)
-    {
-        return false;
-    }
-    if (device->drive_info.ata_Options.generalPurposeLoggingSupported && SUCCESS == get_ATA_Log_Size(device, ATA_LOG_EXTENDED_SMART_SELF_TEST_LOG, &logSize, true, false) && logSize > 0)
-    {
-        //read the extended self test results log with read log ext
-        if (SUCCESS == send_ATA_Read_Log_Ext_Cmd(device, ATA_LOG_EXTENDED_SMART_SELF_TEST_LOG, 0, selfTestResults, LEGACY_DRIVE_SEC_SIZE, 0))
-        {
-            uint16_t selfTestIndex = M_BytesTo2ByteValue(selfTestResults[3], selfTestResults[2]);
-            if (selfTestIndex > 0) 
-            {
-                uint8_t descriptorLength = 26;
-
-                //To calculate page number:
-                //   There are 19 descriptors in 512 bytes.
-                //   There are 4 reserved bytes in each sector + 18 at the end
-                //   26 * 19 + 18 = 512;
-
-                uint16_t zeroBasedIndex = selfTestIndex - 1;
-                uint16_t pageNumber = (zeroBasedIndex) / 19;
-                uint16_t entryWithinPage = (zeroBasedIndex) % 19;
-                uint16_t descriptorOffset = (entryWithinPage * descriptorLength) + 4;
-
-
-                if (VERBOSITY_BUFFERS == device->deviceVerbosity)
-                {
-                   printf("Page Number: %d\n",pageNumber);
-                   printf("Entry within page: %d\n",entryWithinPage);
-                   printf("Descriptor Offset:  %d\n",descriptorOffset);
-                }
-
-                if (pageNumber > 0)
-                {
-                    if (SUCCESS != send_ATA_Read_Log_Ext_Cmd(device, ATA_LOG_EXTENDED_SMART_SELF_TEST_LOG, pageNumber, selfTestResults, LEGACY_DRIVE_SEC_SIZE, 0))
-                    {
-                        //this SHOULDN'T happen, but in case it does, we need to fail gracefully
-                        safe_Free_aligned(selfTestResults)
-                        return false;
-                    }
-                }
-                //if we made it to here, our data buffer now has the log page that contains the descriptor we are looking for
-                if (M_Nibble1(selfTestResults[descriptorOffset + 1]) == 0x07)
-                {
-                    //LBA is a valid entry
-                    isValidLBA = true;
-                    *lba = M_BytesTo8ByteValue(0, 0, \
-                        selfTestResults[descriptorOffset + 10], selfTestResults[descriptorOffset + 9], \
-                        selfTestResults[descriptorOffset + 8], selfTestResults[descriptorOffset + 7], \
-                        selfTestResults[descriptorOffset + 6], selfTestResults[descriptorOffset + 5]);
-                }
-            }
-        }
-    }
-    else if(is_SMART_Enabled(device) && (device->drive_info.IdentifyData.ata.Word084 & BIT0 || device->drive_info.IdentifyData.ata.Word087 & BIT0) && SUCCESS == get_ATA_Log_Size(device, ATA_LOG_SMART_SELF_TEST_LOG, &logSize, false, true) && logSize > 0)
-    {
-        //read the self tests results log with SMART read log
-        if (SUCCESS == ata_SMART_Read_Log(device, ATA_LOG_SMART_SELF_TEST_LOG, selfTestResults, LEGACY_DRIVE_SEC_SIZE))
-        {
-            uint8_t selfTestIndex = selfTestResults[508];
-            if (selfTestIndex > 0)
-            {
-                uint8_t descriptorLength = 24;
-                uint8_t descriptorOffset = ((selfTestIndex * descriptorLength) - descriptorLength) + 2;
-                uint8_t executionStatusByte = selfTestResults[descriptorOffset + 1];
-                if (M_Nibble1(executionStatusByte) == 0x07)
-                {
-                    //LBA is a valid entry
-                    isValidLBA = true;
-                    *lba = C_CAST(uint64_t, M_BytesTo4ByteValue(selfTestResults[descriptorOffset + 8], selfTestResults[descriptorOffset + 7], \
-                        selfTestResults[descriptorOffset + 6], selfTestResults[descriptorOffset + 5]));
-                }
-            }
-        }
-    }
-    safe_Free_aligned(selfTestResults)
-    return isValidLBA;
-}
-
-bool get_Error_LBA_From_SCSI_DST_Log(tDevice *device, uint64_t *lba)
-{
-    bool isValidLBA = false;
-    uint8_t *selfTestResultsLog = C_CAST(uint8_t*, calloc_aligned(LP_SELF_TEST_RESULTS_LEN, sizeof(uint8_t), device->os_info.minimumAlignment));
-    if (!selfTestResultsLog)
-    {
-        return false;
-    }
-    if (SUCCESS == scsi_Log_Sense_Cmd(device, false, LPC_CUMULATIVE_VALUES, LP_SELF_TEST_RESULTS, 0, 0, selfTestResultsLog, LP_SELF_TEST_RESULTS_LEN))
-    {
-        uint8_t parameterOffset = 4;
-        //most recent result is always at the top of the log
-        uint8_t selfTestResult = M_Nibble0(selfTestResultsLog[parameterOffset + 4]);
-        //TODO: If we ever find another scsi device type where this is not true, we should keep this as a special case for ATA drives or block devices since they seem to report the failure this way.
-        if (selfTestResult == 0x07/*read element failure*/)
-        {
-            
-            *lba = M_BytesTo8ByteValue(selfTestResultsLog[parameterOffset + 8], selfTestResultsLog[parameterOffset + 9], \
-                selfTestResultsLog[parameterOffset + 10], selfTestResultsLog[parameterOffset + 11], \
-                selfTestResultsLog[parameterOffset + 12], selfTestResultsLog[parameterOffset + 13], \
-                selfTestResultsLog[parameterOffset + 14], selfTestResultsLog[parameterOffset + 15]);
-            //SCSI spec says that is the error is associated with an LBA, then it will have an LBA valud, otherwise it will be all F's
-            if (*lba != UINT64_MAX)
-            {
-                isValidLBA = true;
-            }
-        }
-    }
-    safe_Free_aligned(selfTestResultsLog)
-    return isValidLBA;
-}
-
-#if !defined (DISABLE_NVME_PASSTHROUGH)
-bool get_Error_LBA_From_NVMe_DST_Log(tDevice *device, uint64_t *lba)
-{
-    bool isValidLBA = false;
-    nvmeGetLogPageCmdOpts dstLogParms;
-    memset(&dstLogParms, 0, sizeof(nvmeGetLogPageCmdOpts));
-    uint8_t nvmeDSTLog[564] = { 0 };
-    dstLogParms.addr = nvmeDSTLog;
-    dstLogParms.dataLen = 564;
-    dstLogParms.lid = 0x06;
-    dstLogParms.nsid = UINT32_MAX;
-    if (SUCCESS == nvme_Get_Log_Page(device, &dstLogParms))
-    {
-        //first entry is most recent and starts at offset of 4
-        if (nvmeDSTLog[4 + 2] & BIT1)//check if flba is set
-        {
-            isValidLBA = true;
-            *lba = M_BytesTo8ByteValue(nvmeDSTLog[4 + 23], nvmeDSTLog[4 + 22], nvmeDSTLog[4 + 21], nvmeDSTLog[4 + 20], nvmeDSTLog[4 + 19], nvmeDSTLog[4 + 18], nvmeDSTLog[4 + 17], nvmeDSTLog[4 + 16]);
-        }
-    }
-    return isValidLBA;
-}
-
-#endif
-
 bool get_Error_LBA_From_DST_Log(tDevice *device, uint64_t *lba)
 {
     bool isValidLBA = false;
     *lba = UINT64_MAX;//set to something crazy in case caller ignores return type
-    switch (device->drive_info.drive_type)
+    dstLogEntries dstEntries;
+    memset(&dstEntries, 0, sizeof(dstLogEntries));
+    if (get_DST_Log_Entries(device, &dstEntries) == SUCCESS)
     {
-    case ATA_DRIVE:
-        isValidLBA = get_Error_LBA_From_ATA_DST_Log(device, lba);
-        if (!isValidLBA && device->drive_info.interface_type != IDE_INTERFACE)
+        if (dstEntries.numberOfEntries > 0
+            && dstEntries.dstEntry[0].descriptorValid
+            && M_Nibble1(dstEntries.dstEntry[0].selfTestExecutionStatus) == 0x07)
         {
-            //try reading the scsi DST log since we didn't successfully retrieve it from the ATA log with passthrough commands
-            isValidLBA = get_Error_LBA_From_SCSI_DST_Log(device, lba);
+            isValidLBA = true;
+            *lba = dstEntries.dstEntry[0].lbaOfFailure;
         }
-        break;
-    case NVME_DRIVE:
-#if !defined (DISABLE_NVME_PASSTHROUGH)
-        isValidLBA = get_Error_LBA_From_NVMe_DST_Log(device, lba);
-        break;
-#endif
-    case SCSI_DRIVE:
-        isValidLBA = get_Error_LBA_From_SCSI_DST_Log(device, lba);
-        break;
-    default:
-        break;
     }
     return isValidLBA;
 }
 
-int run_DST_And_Clean(tDevice *device, uint16_t errorLimit, custom_Update updateFunction, void *updateData, ptrDSTAndCleanErrorList externalErrorList, bool *repaired)
+eReturnValues run_DST_And_Clean(tDevice *device, uint16_t errorLimit, custom_Update updateFunction, void *updateData, ptrDSTAndCleanErrorList externalErrorList, bool *repaired)
 {
-    int ret = SUCCESS;//assume this works successfully
-    errorLBA *errorList = NULL;
-    bool localErrorList = false;
-    uint64_t *errorIndex = NULL;
+    eReturnValues ret = SUCCESS;//assume this works successfully
+    errorLBA *errorList = M_NULLPTR;
+    uint64_t *errorIndex = M_NULLPTR;
     uint64_t localErrorIndex = 0;
     uint64_t totalErrors = 0;
     bool unableToRepair = false;
@@ -1150,7 +1234,7 @@ int run_DST_And_Clean(tDevice *device, uint16_t errorLimit, custom_Update update
     }
     if (!externalErrorList)
     {
-        size_t errorListAllocation = 0; 
+        size_t errorListAllocation = 0;
         if (errorLimit < 1)
         {
             errorListAllocation = sizeof(errorLBA);//allocate a list length of 1..that way we have something if the rest of the function does try and access this memory.
@@ -1159,14 +1243,12 @@ int run_DST_And_Clean(tDevice *device, uint16_t errorLimit, custom_Update update
         {
             errorListAllocation = errorLimit * sizeof(errorLBA);
         }
-        errorList = C_CAST(errorLBA*, calloc_aligned(errorListAllocation, sizeof(errorLBA), device->os_info.minimumAlignment));
+        errorList = C_CAST(errorLBA*, safe_calloc_aligned(errorListAllocation, sizeof(errorLBA), device->os_info.minimumAlignment));
         if (!errorList)
         {
             perror("calloc failure\n");
             return MEMORY_FAILURE;
         }
-        errorList[0].errorAddress = UINT64_MAX;
-        localErrorList = true;
         errorIndex = &localErrorIndex;
     }
     else
@@ -1190,7 +1272,7 @@ int run_DST_And_Clean(tDevice *device, uint16_t errorLimit, custom_Update update
             printf("Running DST.\n");
         }
 
-        if (SUCCESS == run_DST(device, 1, false, false, true))
+        if (SUCCESS == run_DST(device, DST_TYPE_SHORT, false, false, true))
         {
             //poll until it finished
             delay_Seconds(1);
@@ -1198,29 +1280,40 @@ int run_DST_And_Clean(tDevice *device, uint16_t errorLimit, custom_Update update
             uint32_t percentComplete = 0;
             uint32_t lastProgressIndication = 0;
             uint8_t delayTime = 5;//Start with 5. If after 30 seconds, progress has not changed, increase the delay to 15seconds. If it still fails to update after the next minute, break out and abort the DST.
-            time_t dstProgressTimer = time(NULL);
+            time_t dstProgressTimer = time(M_NULLPTR);
+            time_t startTime = time(M_NULLPTR);
             uint8_t timeExtensionCount = 0;
             bool dstAborted = false;
-            while (status == 0x0F && ret == SUCCESS)
+            uint32_t timeDiff = 30;
+            uint32_t maxTimeIncreases = 2;
+            //uint32_t timeIncreaseWarningCount = 1;
+            uint32_t totalDSTTimeSeconds = 120;
+            uint32_t maxDSTWaitTimeSeconds = totalDSTTimeSeconds * 5;
+            while (status == 0x0F && (ret == SUCCESS || ret == IN_PROGRESS))
             {
                 lastProgressIndication = percentComplete;
-                delay_Seconds(delayTime);
                 ret = get_DST_Progress(device, &percentComplete, &status);
-                if (difftime(time(NULL), dstProgressTimer) > 30 && lastProgressIndication == percentComplete)
+                if (difftime(time(M_NULLPTR), dstProgressTimer) > timeDiff && lastProgressIndication == percentComplete)
                 {
                     //We are likely pinging the drive too quickly during the read test and error recovery isn't finishing...extend the delay time
-                    delayTime *= 2;
-                    ++timeExtensionCount;
-                    dstProgressTimer = time(NULL);//reset this beginning timer since we changed the polling time
-                    if (timeExtensionCount > 2)
+                    if (timeExtensionCount <= maxTimeIncreases)
                     {
+                        delayTime *= 2;
+                        timeDiff *= 2;
+                        ++timeExtensionCount;
+                    }
+                    dstProgressTimer = time(M_NULLPTR);//reset this beginning timer since we changed the polling time
+                    if (timeExtensionCount > maxTimeIncreases && difftime(dstProgressTimer, startTime) > maxDSTWaitTimeSeconds)
+                    {
+                        //only abort if we are past the total DST time and have already increased the delays multiple times.
                         //we've extended the polling time too much. Something else is wrong in the drive. Just abort it and exit.
                         ret = abort_DST(device);
                         dstAborted = true;
                         ret = ABORTED;
-                        break;//break out of the loop so we don't hang forever
+                        break;
                     }
                 }
+                delay_Seconds(delayTime);
             }
             if (dstAborted)
             {
@@ -1237,16 +1330,16 @@ int run_DST_And_Clean(tDevice *device, uint16_t errorLimit, custom_Update update
                 if (get_Error_LBA_From_DST_Log(device, &errorList[*errorIndex].errorAddress))
                 {
                     totalErrors++; // Increment the number of errors we have seen
-                    if (totalErrors > errorLimit) 
+                    if (totalErrors > errorLimit)
                     {
                         break;
                     }
                     if (device->deviceVerbosity > VERBOSITY_QUIET)
                     {
-                        printf("Reparing LBA %"PRIu64"\n", errorList[*errorIndex].errorAddress);
+                        printf("Reparing LBA %" PRIu64 "\n", errorList[*errorIndex].errorAddress);
                     }
                     //we got a valid LBA, so time to fix it
-                    int repairRet = repair_LBA(device, &errorList[*errorIndex], passthroughWrite, autoWriteReassign, autoReadReassign);
+                    eReturnValues repairRet = repair_LBA(device, &errorList[*errorIndex], passthroughWrite, autoWriteReassign, autoReadReassign);
                     if (repaired)
                     {
                         *repaired = true;
@@ -1297,7 +1390,7 @@ int run_DST_And_Clean(tDevice *device, uint16_t errorLimit, custom_Update update
                     }
                     //not using generic_tests.h since we don't have a way to force ATA vs SCSI passthrough command for this, and we have times where we must do a passthrough write (USB emulation nonsense)
                     //first try verifying the whole thing at once so we can skip the loop below if it is good
-                    int verify = SUCCESS;
+                    eReturnValues verify = SUCCESS;
                     if (passthroughWrite)
                     {
                         verify = ata_Read_Verify(device, readAroundStart, C_CAST(uint32_t, readAroundRange));
@@ -1332,12 +1425,12 @@ int run_DST_And_Clean(tDevice *device, uint16_t errorLimit, custom_Update update
                             {
                                 if (device->deviceVerbosity > VERBOSITY_QUIET)
                                 {
-                                    printf("Reparing LBA %"PRIu64"\n", iter);
+                                    printf("Reparing LBA %" PRIu64 "\n", iter);
                                 }
                                 //add the LBA to the error list we have going, then repair it
-                                errorList[totalErrors].repairStatus = NOT_REPAIRED;
-                                errorList[totalErrors].errorAddress = iter;
-                                repairRet = repair_LBA(device, &errorList[totalErrors], passthroughWrite, autoWriteReassign, autoReadReassign);
+                                errorList[*errorIndex].repairStatus = NOT_REPAIRED;
+                                errorList[*errorIndex].errorAddress = iter;
+                                repairRet = repair_LBA(device, &errorList[*errorIndex], passthroughWrite, autoWriteReassign, autoReadReassign);
                                 ++totalErrors;
                                 ++(*errorIndex);
                                 if (FAILURE == repairRet)
@@ -1376,58 +1469,57 @@ int run_DST_And_Clean(tDevice *device, uint16_t errorLimit, custom_Update update
             break;
         }
     }
-    //printf("totalErrors:  %"PRIu64"\n", totalErrors);
-    //printf("errorIndex:  %"PRIu64"\n", errorIndex);
-    //printf("errorLimit:  %"PRIu16"\n", errorLimit);
+    //printf("totalErrors:  %" PRIu64 "\n", totalErrors);
+    //printf("errorIndex:  %" PRIu64 "\n", errorIndex);
+    //printf("errorLimit:  %" PRIu16 "\n", errorLimit);
     if (totalErrors > errorLimit)
     {
         ret = FAILURE;
     }
-    if (device->deviceVerbosity > VERBOSITY_QUIET && localErrorList)
+    if (!externalErrorList)
     {
-        if (errorList[0].errorAddress != UINT64_MAX)
+        if (device->deviceVerbosity > VERBOSITY_QUIET)
         {
-            print_LBA_Error_List(errorList, C_CAST(uint16_t, *errorIndex));
-            if (unableToRepair)
+            if (totalErrors > 0)
             {
-                printf("Other errors were found during DST, but were unable to be repaired.\n");
+                print_LBA_Error_List(errorList, C_CAST(uint16_t, *errorIndex));
+                if (unableToRepair)
+                {
+                    printf("Other errors were found during DST, but were unable to be repaired.\n");
+                }
+            }
+            else if (unableToRepair)
+            {
+                printf("An error was detected during DST but it is unable to be repaired.\n");
+            }
+            else
+            {
+                printf("No bad LBAs detected during DST and Clean.\n");
             }
         }
-        else if (unableToRepair)
-        {
-            printf("An error was detected during DST but it is unable to be repaired.\n");
-        }
-        else
-        {
-            printf("No bad LBAs detected during DST and Clean.\n");
-        }
-        safe_Free_aligned(errorList)
+        safe_Free_aligned(C_CAST(void**, &errorList));
     }
     return ret;
 }
 #define ENABLE_DST_LOG_DEBUG 0 //set to non zero to enable this debug.
-//TODO: This should grab the entries in order from most recent to oldest...current sort via timestamp won't fix getting the most recent one first.
-int get_ATA_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
+
+static eReturnValues get_ATA_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
 {
-    int ret = NOT_SUPPORTED;
-    uint8_t *selfTestResults = NULL;
+    eReturnValues ret = NOT_SUPPORTED;
+    uint8_t *selfTestResults = M_NULLPTR;
     uint32_t logSize = 0;//used for compatibility purposes with drives that may have GPL, but not support the ext log...
     //device->drive_info.ata_Options.generalPurposeLoggingSupported = false;//for debugging SMART log version
     if (device->drive_info.ata_Options.generalPurposeLoggingSupported && SUCCESS == get_ATA_Log_Size(device, ATA_LOG_EXTENDED_SMART_SELF_TEST_LOG, &logSize, true, false) && logSize > 0)
     {
-        uint32_t extLogSize = LEGACY_DRIVE_SEC_SIZE;
-        if(SUCCESS != get_ATA_Log_Size(device, ATA_LOG_EXTENDED_SMART_SELF_TEST_LOG, &extLogSize, true, false))
-        {
-            return NOT_SUPPORTED;
-        }
-        selfTestResults = C_CAST(uint8_t*, calloc_aligned(extLogSize, sizeof(uint8_t), device->os_info.minimumAlignment));
+        uint32_t extLogSize = logSize;
+        selfTestResults = C_CAST(uint8_t*, safe_calloc_aligned(extLogSize, sizeof(uint8_t), device->os_info.minimumAlignment));
         uint16_t lastPage = C_CAST(uint16_t, (extLogSize / LEGACY_DRIVE_SEC_SIZE) - 1);//zero indexed
         if (!selfTestResults)
         {
             return MEMORY_FAILURE;
         }
         //read the extended self test results log with read log ext
-        if (SUCCESS == get_ATA_Log(device, ATA_LOG_EXTENDED_SMART_SELF_TEST_LOG, NULL, NULL, true, false, true, selfTestResults, extLogSize, NULL, 0,0))
+        if (SUCCESS == get_ATA_Log(device, ATA_LOG_EXTENDED_SMART_SELF_TEST_LOG, M_NULLPTR, M_NULLPTR, true, false, true, selfTestResults, extLogSize, M_NULLPTR, 0, 0))
         //if (SUCCESS == ata_Read_Log_Ext(device, ATA_LOG_EXTENDED_SMART_SELF_TEST_LOG, 0, selfTestResults, LEGACY_DRIVE_SEC_SIZE, device->drive_info.ata_Options.readLogWriteLogDMASupported, 0))
         {
             ret = SUCCESS;
@@ -1435,39 +1527,38 @@ int get_ATA_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
             uint16_t selfTestIndex = M_BytesTo2ByteValue(selfTestResults[3], selfTestResults[2]);
             if (selfTestIndex > 0)//we know DST has been run at least once...
             {
-                uint8_t descriptorLength = 26;
-                uint8_t zeroCompare[26] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+                uint8_t descriptorLength = UINT8_C(26);
                 //To calculate page number:
                 //   There are 19 descriptors in 512 bytes.
                 //   There are 4 reserved bytes in each sector + 18 at the end
                 //   26 * 19 + 18 = 512;
 
-                uint16_t zeroBasedIndex = selfTestIndex - 1;
-                uint16_t pageNumber = (zeroBasedIndex) / 19;
-                uint16_t entryWithinPage = (zeroBasedIndex) % 19;
-                uint16_t descriptorOffset = (entryWithinPage * descriptorLength) + 4;//offset withing the page
-                #if ENABLE_DST_LOG_DEBUG
+                uint16_t zeroBasedIndex = selfTestIndex - UINT16_C(1);
+                uint16_t pageNumber = (zeroBasedIndex) / UINT16_C(19);
+                uint16_t entryWithinPage = (zeroBasedIndex) % UINT16_C(19);
+                uint16_t descriptorOffset = C_CAST(uint16_t, (entryWithinPage * descriptorLength) + UINT16_C(4));//offset withing the page
+#if ENABLE_DST_LOG_DEBUG
                 printf("starting at page number = %u\n", pageNumber);
                 printf("lastPage = %u\n", lastPage);
-                #endif
-                uint32_t offset = (pageNumber > 0) ? descriptorOffset * pageNumber : descriptorOffset;
+#endif
+                uint32_t offset = (pageNumber > UINT32_C(0)) ? descriptorOffset * pageNumber : descriptorOffset;
                 uint32_t firstOffset = offset;
-                uint16_t counter = 0;//when this get's larger than our max, we need to break out of the loop. This is always incremented. - TJE
-                uint16_t maxEntries = (lastPage + 1) * 19;//this should get us some multiple of 19 based on the number of pages we read.
-                #if ENABLE_DST_LOG_DEBUG
+                uint16_t counter = UINT16_C(0);//when this get's larger than our max, we need to break out of the loop. This is always incremented. - TJE
+                uint16_t maxEntries = C_CAST(uint16_t, (lastPage + UINT16_C(1)) * UINT16_C(19));//this should get us some multiple of 19 based on the number of pages we read.
+#if ENABLE_DST_LOG_DEBUG
                 printf("maxEntries = %u\n", maxEntries);
-                #endif
-                while(counter <= maxEntries)
+#endif
+                while (counter <= maxEntries)
                 {
-                    #if ENABLE_DST_LOG_DEBUG
+#if ENABLE_DST_LOG_DEBUG
                     printf("offset = %u\n", offset);
-                    #endif
-                    if(counter > 0 && offset == firstOffset)
+#endif
+                    if (counter > 0 && offset == firstOffset)
                     {
                         //we're back at the beginning and need to exit the loop.
                         break;
                     }
-                    if (memcmp(&selfTestResults[offset], zeroCompare, descriptorLength))//invalid entires will be all zeros-TJE
+                    if (!is_Empty(&selfTestResults[offset], descriptorLength))//invalid entires will be all zeros-TJE
                     {
                         entries->dstEntry[entries->numberOfEntries].descriptorValid = true;
                         entries->dstEntry[entries->numberOfEntries].selfTestRun = selfTestResults[offset];
@@ -1475,15 +1566,23 @@ int get_ATA_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
                         entries->dstEntry[entries->numberOfEntries].lifetimeTimestamp = M_BytesTo2ByteValue(selfTestResults[offset + 3], selfTestResults[offset + 2]);
                         entries->dstEntry[entries->numberOfEntries].checkPointByte = selfTestResults[offset + 4];
                         entries->dstEntry[entries->numberOfEntries].lbaOfFailure = M_BytesTo8ByteValue(0, 0, selfTestResults[offset + 10], selfTestResults[offset + 9], selfTestResults[offset + 8], selfTestResults[offset + 7], selfTestResults[offset + 6], selfTestResults[offset + 5]);
+                        //if LBA field is all F's, this is meant to signify an invalid value like T10 specs say to do - TJE
+                        if (entries->dstEntry[entries->numberOfEntries].lbaOfFailure == MAX_48_BIT_LBA)
+                        {
+                            entries->dstEntry[entries->numberOfEntries].lbaOfFailure = UINT64_MAX;
+                        }
+
                         memcpy(&entries->dstEntry[entries->numberOfEntries].ataVendorSpecificData[0], &selfTestResults[offset + 11], 15);
                         //dummy up sense data...
-                        switch (entries->dstEntry[entries->numberOfEntries].selfTestExecutionStatus)
+                        switch (M_Nibble1(entries->dstEntry[entries->numberOfEntries].selfTestExecutionStatus))
                         {
                         case 0:
                         case 15:
                             entries->dstEntry[entries->numberOfEntries].scsiSenseCode.senseKey = SENSE_KEY_NO_ERROR;
                             entries->dstEntry[entries->numberOfEntries].scsiSenseCode.additionalSenseCode = 0;
                             entries->dstEntry[entries->numberOfEntries].scsiSenseCode.additionalSenseCodeQualifier = 0;
+                            //NOTE: This is a workaround to clear out the LBA on success:
+                            entries->dstEntry[entries->numberOfEntries].lbaOfFailure = UINT64_MAX;
                             break;
                         case 1:
                             entries->dstEntry[entries->numberOfEntries].scsiSenseCode.senseKey = SENSE_KEY_ABORTED_COMMAND;
@@ -1530,26 +1629,26 @@ int get_ATA_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
                         }
                         ++entries->numberOfEntries;
                     }
-                    if(offset > descriptorLength)
+                    if (offset > descriptorLength)
                     {
                         uint32_t offsetCheck = 0;
                         //offset needs to subtract since we work backwards from the end (until rollover)
                         offset -= descriptorLength;
                         offsetCheck = offset;
-                        #if ENABLE_DST_LOG_DEBUG
+#if ENABLE_DST_LOG_DEBUG
                         printf("\toffsetCheck = %u ", offsetCheck);
-                        #endif
-                        if(pageNumber > 0 && offsetCheck > C_CAST(uint32_t, (LEGACY_DRIVE_SEC_SIZE * pageNumber)))//this cast is extremely stupid. Apparently MSFT's UINT16_C doesn't actually force it to unsigned properly, so this generates an unneccessary warning
-                        {   
+#endif
+                        if (pageNumber > 0 && offsetCheck > C_CAST(uint32_t, (LEGACY_DRIVE_SEC_SIZE * pageNumber)))//this cast is extremely stupid. Apparently MSFT's UINT16_C doesn't actually force it to unsigned properly, so this generates an unneccessary warning
+                        {
                             offsetCheck -= (LEGACY_DRIVE_SEC_SIZE * pageNumber);
-                            #if ENABLE_DST_LOG_DEBUG
+#if ENABLE_DST_LOG_DEBUG
                             printf("\tsubtracting %u", (LEGACY_DRIVE_SEC_SIZE * pageNumber));
-                            #endif
+#endif
                         }
-                        #if ENABLE_DST_LOG_DEBUG
+#if ENABLE_DST_LOG_DEBUG
                         printf("\n");
-                        #endif
-                        if(offsetCheck < 4 || offsetCheck > 472)
+#endif
+                        if (offsetCheck < 4 || offsetCheck > UINT32_C(472))
                         {
                             if (pageNumber > 0)
                             {
@@ -1559,18 +1658,18 @@ int get_ATA_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
                             {
                                 pageNumber = lastPage;
                             }
-                            offset = 472 + (pageNumber * LEGACY_DRIVE_SEC_SIZE);
+                            offset = UINT32_C(472) + (pageNumber * LEGACY_DRIVE_SEC_SIZE);
                         }
                     }
                     else
                     {
-                        #if ENABLE_DST_LOG_DEBUG
+#if ENABLE_DST_LOG_DEBUG
                         printf("\tsetting offset to 472 on last page read\n");
-                        #endif
-                        offset = 472 + (lastPage * LEGACY_DRIVE_SEC_SIZE);
+#endif
+                        offset = UINT32_C(472) + (lastPage * LEGACY_DRIVE_SEC_SIZE);
                     }
                     ++counter;
-                    if(entries->numberOfEntries >= MAX_DST_ENTRIES)
+                    if (entries->numberOfEntries >= MAX_DST_ENTRIES)
                     {
                         break;
                     }
@@ -1578,9 +1677,9 @@ int get_ATA_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
             }
         }
     }
-    else if (is_SMART_Enabled(device) && (device->drive_info.IdentifyData.ata.Word084 & BIT0 || device->drive_info.IdentifyData.ata.Word087 & BIT0) && SUCCESS == get_ATA_Log_Size(device, ATA_LOG_SMART_SELF_TEST_LOG, &logSize, false, true) && logSize > 0)
+    else if (is_SMART_Enabled(device) && is_SMART_Error_Logging_Supported(device) && SUCCESS == get_ATA_Log_Size(device, ATA_LOG_SMART_SELF_TEST_LOG, &logSize, false, true) && logSize > 0)
     {
-        selfTestResults = C_CAST(uint8_t*, calloc_aligned(LEGACY_DRIVE_SEC_SIZE, sizeof(uint8_t), device->os_info.minimumAlignment));
+        selfTestResults = C_CAST(uint8_t*, safe_calloc_aligned(LEGACY_DRIVE_SEC_SIZE, sizeof(uint8_t), device->os_info.minimumAlignment));
         if (!selfTestResults)
         {
             return MEMORY_FAILURE;
@@ -1593,14 +1692,13 @@ int get_ATA_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
             uint8_t selfTestIndex = selfTestResults[508];
             if (selfTestIndex > 0)
             {
-                uint8_t descriptorLength = 24;
-                uint8_t descriptorOffset = ((selfTestIndex * descriptorLength) - descriptorLength) + 2;
-                uint8_t zeroCompare[24] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, };
+                uint8_t descriptorLength = UINT8_C(24);
+                uint8_t descriptorOffset = C_CAST(uint8_t, ((selfTestIndex * descriptorLength) - descriptorLength) + UINT8_C(2));
                 uint16_t offset = descriptorOffset;
                 uint16_t counter = 0;//when this get's larger than our max, we need to break out of the loop. This is always incremented. - TJE
-                while(counter < MAX_DST_ENTRIES && counter < 21)//max of 21 dst entries in this log
+                while (counter < MAX_DST_ENTRIES /*&& counter < 21*/)//max of 21 dst entries in this log
                 {
-                    if (memcmp(&selfTestResults[offset], zeroCompare, descriptorLength))//invalid entires will be all zeros-TJE
+                    if (!is_Empty(&selfTestResults[offset], descriptorLength))
                     {
                         entries->dstEntry[entries->numberOfEntries].descriptorValid = true;
                         entries->dstEntry[entries->numberOfEntries].selfTestRun = selfTestResults[offset];
@@ -1609,14 +1707,23 @@ int get_ATA_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
                         entries->dstEntry[entries->numberOfEntries].checkPointByte = selfTestResults[offset + 4];
                         entries->dstEntry[entries->numberOfEntries].lbaOfFailure = M_BytesTo4ByteValue(selfTestResults[offset + 8], selfTestResults[offset + 7], selfTestResults[offset + 6], selfTestResults[offset + 5]);
                         memcpy(&entries->dstEntry[entries->numberOfEntries].ataVendorSpecificData[0], &selfTestResults[offset + 9], 15);
+                        //if LBA field is all F's, this is meant to signify an invalid value like T10 specs say to do - TJE
+                        //filtering 28bit all F's and 32bit all F's since it is not clear exactly how many drives will report this invalid value -TJE
+                        if (entries->dstEntry[entries->numberOfEntries].lbaOfFailure == MAX_28_BIT_LBA || entries->dstEntry[entries->numberOfEntries].lbaOfFailure == UINT32_MAX)
+                        {
+                            entries->dstEntry[entries->numberOfEntries].lbaOfFailure = UINT64_MAX;
+                        }
+
                         //dummy up sense data...
-                        switch (entries->dstEntry[entries->numberOfEntries].selfTestExecutionStatus)
+                        switch (M_Nibble1(entries->dstEntry[entries->numberOfEntries].selfTestExecutionStatus))
                         {
                         case 0:
                         case 15:
                             entries->dstEntry[entries->numberOfEntries].scsiSenseCode.senseKey = SENSE_KEY_NO_ERROR;
                             entries->dstEntry[entries->numberOfEntries].scsiSenseCode.additionalSenseCode = 0;
                             entries->dstEntry[entries->numberOfEntries].scsiSenseCode.additionalSenseCodeQualifier = 0;
+                            //NOTE: This is a workaround to clear out the LBA on success:
+                            entries->dstEntry[entries->numberOfEntries].lbaOfFailure = UINT64_MAX;
                             break;
                         case 1:
                             entries->dstEntry[entries->numberOfEntries].scsiSenseCode.senseKey = SENSE_KEY_ABORTED_COMMAND;
@@ -1662,18 +1769,18 @@ int get_ATA_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
                             break;
                         }
                         ++entries->numberOfEntries;
-                    }                
-                    if(offset > descriptorLength)
+                    }
+                    if (offset > descriptorLength)
                     {
                         uint16_t offsetCheck = 0;
                         //offset needs to subtract since we work backwards from the end (until rollover)
                         offset -= descriptorLength;
                         offsetCheck = offset;
-                        if(offsetCheck > LEGACY_DRIVE_SEC_SIZE)
+                        if (offsetCheck > LEGACY_DRIVE_SEC_SIZE)
                         {
                             offsetCheck -= LEGACY_DRIVE_SEC_SIZE;
                         }
-                        if(offsetCheck < 2 || offsetCheck > 482)
+                        if (offsetCheck < 2 || offsetCheck > 482)
                         {
                             //need to adjust offset to 482 (since we are rolling over back to beginning)
                             offset = 482;
@@ -1689,14 +1796,14 @@ int get_ATA_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
             }
         }
     }
-    safe_Free_aligned(selfTestResults)
+    safe_free_aligned(&selfTestResults);
     return ret;
 }
 
-int get_SCSI_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
+static eReturnValues get_SCSI_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
 {
-    int ret = NOT_SUPPORTED;
-    uint8_t dstLog[LP_SELF_TEST_RESULTS_LEN] = { 0 };
+    eReturnValues ret = NOT_SUPPORTED;
+    DECLARE_ZERO_INIT_ARRAY(uint8_t, dstLog, LP_SELF_TEST_RESULTS_LEN);
     if (!entries)
     {
         return BAD_PARAMETER;
@@ -1713,7 +1820,7 @@ int get_SCSI_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
             if (memcmp(&dstLog[offset + 4], zeroCompare, 16))//if this doesn't match, we have an entry...-TJE
             {
                 entries->dstEntry[entries->numberOfEntries].descriptorValid = true;
-                entries->dstEntry[entries->numberOfEntries].selfTestExecutionStatus = M_Nibble0(dstLog[offset + 4]) << 4;
+                entries->dstEntry[entries->numberOfEntries].selfTestExecutionStatus = C_CAST(uint8_t, M_Nibble0(dstLog[offset + 4]) << 4);
                 entries->dstEntry[entries->numberOfEntries].selfTestRun = M_Nibble1(dstLog[offset + 4]) >> 1;
                 entries->dstEntry[entries->numberOfEntries].checkPointByte = dstLog[offset + 5];
                 entries->dstEntry[entries->numberOfEntries].lifetimeTimestamp = M_BytesTo2ByteValue(dstLog[offset + 6], dstLog[offset + 7]);
@@ -1729,10 +1836,9 @@ int get_SCSI_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
     return ret;
 }
 
-#if !defined(DISABLE_NVME_PASSTHROUGH)
-int get_NVMe_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
+static eReturnValues get_NVMe_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
 {
-    int ret = NOT_SUPPORTED;
+    eReturnValues ret = NOT_SUPPORTED;
     if (!entries)
     {
         return BAD_PARAMETER;
@@ -1741,7 +1847,7 @@ int get_NVMe_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
     {
         nvmeGetLogPageCmdOpts dstLogParms;
         memset(&dstLogParms, 0, sizeof(nvmeGetLogPageCmdOpts));
-        uint8_t nvmeDSTLog[564] = { 0 };
+        DECLARE_ZERO_INIT_ARRAY(uint8_t, nvmeDSTLog, 564);
         dstLogParms.addr = nvmeDSTLog;
         dstLogParms.dataLen = 564;
         dstLogParms.lid = 0x06;
@@ -1754,8 +1860,7 @@ int get_NVMe_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
             for (uint32_t offset = 4; offset < 564 && entries->numberOfEntries < 20; offset += 28)//maximum of 20 NVMe DST log entires
             {
                 //check if the entry is valid by checking for zeros
-                uint8_t zeros[28] = { 0 };
-                if (memcmp(zeros, &nvmeDSTLog[offset], 28) && M_Nibble0(nvmeDSTLog[offset + 0]) != 0x0F)//0F in NVMe is an unused entry.
+                if (!is_Empty(&nvmeDSTLog[offset], 28) && M_Nibble0(nvmeDSTLog[offset + 0]) != 0x0F)//0F in NVMe is an unused entry.
                 {
                     entries->dstEntry[entries->numberOfEntries].selfTestRun = M_Nibble1(nvmeDSTLog[offset + 0]);
                     entries->dstEntry[entries->numberOfEntries].selfTestExecutionStatus = M_Nibble0(nvmeDSTLog[offset + 0]);
@@ -1799,18 +1904,15 @@ int get_NVMe_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
     }
     return ret;
 }
-#endif
 
-int get_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
+eReturnValues get_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
 {
     switch (device->drive_info.drive_type)
     {
     case ATA_DRIVE:
         return get_ATA_DST_Log_Entries(device, entries);
     case NVME_DRIVE:
-#if !defined (DISABLE_NVME_PASSTHROUGH)
         return get_NVMe_DST_Log_Entries(device, entries);
-#endif
     case SCSI_DRIVE:
         return get_SCSI_DST_Log_Entries(device, entries);
     default:
@@ -1818,7 +1920,7 @@ int get_DST_Log_Entries(tDevice *device, ptrDstLogEntries entries)
     }
 }
 
-int print_DST_Log_Entries(ptrDstLogEntries entries)
+eReturnValues print_DST_Log_Entries(ptrDstLogEntries entries)
 {
     if (!entries)
     {
@@ -1847,8 +1949,7 @@ int print_DST_Log_Entries(ptrDstLogEntries entries)
         //test types NVMe
         //short
         //extended
-        
-        //TODO: Need to change some wording or screen output for ATA & SCSI vs NVMe
+
         if (entries->logType == DST_LOG_TYPE_NVME)
         {
             //checkpoint = segment?
@@ -1858,7 +1959,7 @@ int print_DST_Log_Entries(ptrDstLogEntries entries)
         {
             printf(" # %-21s  %-9s  %-26s  %-14s  %-10s  %-9s\n", "Test", "Timestamp", "Execution Status", "Error LBA", "Checkpoint", "Sense Info");
         }
-        for (uint8_t iter = 0, counter = 0; iter < entries->numberOfEntries; ++iter)
+        for (uint8_t iter = 0; iter < entries->numberOfEntries; ++iter)
         {
             if (!entries->dstEntry[iter].descriptorValid)
             {
@@ -1868,46 +1969,46 @@ int print_DST_Log_Entries(ptrDstLogEntries entries)
             printf("%2" PRIu8 " ", iter + 1);
             //Test
 #define SELF_TEST_RUN_STRING_MAX_LENGTH 22
-            char selfTestRunString[SELF_TEST_RUN_STRING_MAX_LENGTH] = { 0 };
+            DECLARE_ZERO_INIT_ARRAY(char, selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH);
             if (entries->logType == DST_LOG_TYPE_ATA)
             {
                 switch (entries->dstEntry[iter].selfTestRun)
                 {
                 case 0:
-                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Offline Data Collect");
+                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Offline Data Collect");
                     break;
                 case 1://short
-                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Short (offline)");
+                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Short (offline)");
                     break;
                 case 2://extended
-                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Extended (offline)");
+                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Extended (offline)");
                     break;
                 case 3://conveyance
-                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Conveyance (offline)");
+                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Conveyance (offline)");
                     break;
                 case 4://selective
-                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Selective (offline)");
+                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Selective (offline)");
                     break;
                 case 0x81://short
-                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Short (captive)");
+                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Short (captive)");
                     break;
                 case 0x82://extended
-                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Extended (captive)");
+                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Extended (captive)");
                     break;
                 case 0x83://conveyance
-                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Conveyance (captive)");
+                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Conveyance (captive)");
                     break;
                 case 0x84://selective
-                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Selective (captive)");
+                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Selective (captive)");
                     break;
                 default:
                     if ((entries->dstEntry[iter].selfTestRun >= 0x40 && entries->dstEntry[iter].selfTestRun <= 0x7E) || (entries->dstEntry[iter].selfTestRun >= 0x90 /*&& entries->dstEntry[iter].selfTestRun <= 0xFF*/))
                     {
-                        snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Vendor Specific - %"PRIX8"h", entries->dstEntry[iter].selfTestRun);
+                        snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Vendor Specific - %" PRIX8 "h", entries->dstEntry[iter].selfTestRun);
                     }
                     else
                     {
-                        snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Unknown - %"PRIX8"h", entries->dstEntry[iter].selfTestRun);
+                        snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Unknown - %" PRIX8 "h", entries->dstEntry[iter].selfTestRun);
                     }
                     break;
                 }
@@ -1917,22 +2018,22 @@ int print_DST_Log_Entries(ptrDstLogEntries entries)
                 switch (entries->dstEntry[iter].selfTestRun)
                 {
                 case 0:
-                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Unknown (Not in spec)");
+                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Unknown (Not in spec)");
                     break;
                 case 1://short
-                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Short (background)");
+                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Short (background)");
                     break;
                 case 2://extended
-                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Extended (background)");
+                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Extended (background)");
                     break;
                 case 5://short
-                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Short (foreground)");
+                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Short (foreground)");
                     break;
                 case 6://extended
-                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Extended (foreground)");
+                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Extended (foreground)");
                     break;
                 default:
-                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Unknown - %"PRIX8"h", entries->dstEntry[iter].selfTestRun);
+                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Unknown - %" PRIX8 "h", entries->dstEntry[iter].selfTestRun);
                     break;
                 }
             }
@@ -1941,32 +2042,32 @@ int print_DST_Log_Entries(ptrDstLogEntries entries)
                 switch (entries->dstEntry[iter].selfTestRun)
                 {
                 case 0:
-                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Reserved");
+                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Reserved");
                     break;
                 case 1://short
-                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Short");
+                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Short");
                     break;
                 case 2://extended
-                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Extended");
+                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Extended");
                     break;
                 case 0x0E://vendor specific
-                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Vendor Specific");
+                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Vendor Specific");
                     break;
                 default:
-                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Unknown - %"PRIX8"h", entries->dstEntry[iter].selfTestRun);
+                    snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Unknown - %" PRIX8 "h", entries->dstEntry[iter].selfTestRun);
                     break;
                 }
             }
             else //print the number
             {
-                snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH,  "Unknown - %"PRIX8"h", entries->dstEntry[iter].selfTestRun);
+                snprintf(selfTestRunString, SELF_TEST_RUN_STRING_MAX_LENGTH, "Unknown - %" PRIX8 "h", entries->dstEntry[iter].selfTestRun);
             }
             printf("%-21s  ", selfTestRunString);
             //Timestamp
-            printf("%-9"PRIu32"  ", entries->dstEntry[iter].lifetimeTimestamp);
+            printf("%-9" PRIu64 "  ", entries->dstEntry[iter].lifetimeTimestamp);
             //Execution Status
 #define SELF_TEST_EXECUTION_STATUS_MAX_LENGTH 30
-            char status[SELF_TEST_EXECUTION_STATUS_MAX_LENGTH] = { 0 };
+            DECLARE_ZERO_INIT_ARRAY(char, status, SELF_TEST_EXECUTION_STATUS_MAX_LENGTH);
             uint8_t percentRemaining = 0;
             if (entries->logType == DST_LOG_TYPE_ATA)
             {
@@ -2049,14 +2150,14 @@ int print_DST_Log_Entries(ptrDstLogEntries entries)
             }
             if (percentRemaining > 0)
             {
-                char percentRemainingString[8] = { 0 };
+                DECLARE_ZERO_INIT_ARRAY(char, percentRemainingString, 8);
                 snprintf(percentRemainingString, 8, " (%" PRIu8 "%%)", percentRemaining);
                 common_String_Concat(status, SELF_TEST_EXECUTION_STATUS_MAX_LENGTH, percentRemainingString);
             }
             printf("%-26s  ", status);
             //Error LBA
 #define SELF_TEST_ERROR_LBA_STRING_MAX_LENGTH 21
-            char errorLBAString[SELF_TEST_ERROR_LBA_STRING_MAX_LENGTH] = { 0 };
+            DECLARE_ZERO_INIT_ARRAY(char, errorLBAString, SELF_TEST_ERROR_LBA_STRING_MAX_LENGTH);
             if (entries->dstEntry[iter].lbaOfFailure == UINT64_MAX)
             {
                 snprintf(errorLBAString, SELF_TEST_ERROR_LBA_STRING_MAX_LENGTH, "None");
@@ -2070,27 +2171,28 @@ int print_DST_Log_Entries(ptrDstLogEntries entries)
             printf("%-10" PRIX8 "  ", entries->dstEntry[iter].checkPointByte);
             //Sense Info
 #define SELF_TEST_SENSE_INFO_STRING_MAX_LENGTH 21
-            char senseInfoString[SELF_TEST_SENSE_INFO_STRING_MAX_LENGTH] = { 0 };
+            DECLARE_ZERO_INIT_ARRAY(char, senseInfoString, SELF_TEST_SENSE_INFO_STRING_MAX_LENGTH);
             if (entries->logType == DST_LOG_TYPE_NVME)
             {
                 //SCT - SC
-                char sctVal[10] = { 0 };
-                char scVal[10] = { 0 };
+#define NVM_STATUS_CODE_STR_LEN 10
+                DECLARE_ZERO_INIT_ARRAY(char, sctVal, NVM_STATUS_CODE_STR_LEN);
+                DECLARE_ZERO_INIT_ARRAY(char, scVal, NVM_STATUS_CODE_STR_LEN);
                 if (entries->dstEntry[iter].nvmeStatus.statusCodeTypeValid)
                 {
-                    snprintf(sctVal, 10, "%02" PRIX8 "", entries->dstEntry[iter].nvmeStatus.statusCodeType);
+                    snprintf(sctVal, NVM_STATUS_CODE_STR_LEN, "%02" PRIX8 "", entries->dstEntry[iter].nvmeStatus.statusCodeType);
                 }
                 else
                 {
-                    snprintf(sctVal, 10, "NA");
+                    snprintf(sctVal, NVM_STATUS_CODE_STR_LEN, "NA");
                 }
                 if (entries->dstEntry[iter].nvmeStatus.statusCodeValid)
                 {
-                    snprintf(sctVal, 10, "%02" PRIX8 "", entries->dstEntry[iter].nvmeStatus.statusCode);
+                    snprintf(sctVal, NVM_STATUS_CODE_STR_LEN, "%02" PRIX8 "", entries->dstEntry[iter].nvmeStatus.statusCode);
                 }
                 else
                 {
-                    snprintf(scVal, 10, "NA");
+                    snprintf(scVal, NVM_STATUS_CODE_STR_LEN, "NA");
                 }
                 snprintf(senseInfoString, SELF_TEST_SENSE_INFO_STRING_MAX_LENGTH, "%s/%s", sctVal, scVal);
             }
@@ -2099,8 +2201,9 @@ int print_DST_Log_Entries(ptrDstLogEntries entries)
                 snprintf(senseInfoString, SELF_TEST_SENSE_INFO_STRING_MAX_LENGTH, "%02"PRIX8"/%02"PRIX8"/%02"PRIX8, entries->dstEntry[iter].scsiSenseCode.senseKey, entries->dstEntry[iter].scsiSenseCode.additionalSenseCode, entries->dstEntry[iter].scsiSenseCode.additionalSenseCodeQualifier);
             }
             printf("%-9s\n", senseInfoString);
-            ++counter;
         }
+        printf("NOTE: DST Log entries are printed out in order from newest to oldest based ATA/SCSI/NVMe\n");
+        printf("      specifications on where to find the latest entry.\n\n");
     }
     return SUCCESS;
 }
